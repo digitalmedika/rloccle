@@ -1,0 +1,176 @@
+use crate::openai::{ChatMessage, OpenAIClient};
+use std::env;
+
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub id: String,
+    pub name: String,
+    pub instructions: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f32>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            id: "default-agent".to_string(),
+            name: "Agent".to_string(),
+            instructions: "".to_string(),
+            model: "openai/gpt-4o".to_string(),
+            base_url: None,
+            api_key: None,
+            temperature: None,
+        }
+    }
+}
+
+pub struct Agent {
+    config: AgentConfig,
+    client: OpenAIClient,
+}
+
+impl Agent {
+    pub fn new(mut config: AgentConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = dotenvy::dotenv();
+
+        if config.model.is_empty() {
+            config.model = env::var("OPENAI_MODEL")
+                .or_else(|_| env::var("AGENT_MODEL"))
+                .unwrap_or_else(|_| "openai/gpt-4o".to_string());
+        }
+
+        let api_key = config.api_key.clone()
+            .or_else(|| env::var("OPENAI_API_KEY").ok())
+            .ok_or("API key is required. Set OPENAI_API_KEY env var or provide it in the configuration.")?;
+
+        let (provider, _) = OpenAIClient::parse_model_string(&config.model);
+        let base_url = config.base_url.clone()
+            .or_else(|| env::var("OPENAI_API_BASE").ok())
+            .or_else(|| env::var("OPENAI_BASE_URL").ok())
+            .unwrap_or_else(|| {
+                if provider == "openai" {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    "https://api.openai.com/v1".to_string()
+                }
+            });
+
+        let client = OpenAIClient::new(base_url, api_key);
+        Ok(Self { config, client })
+    }
+
+    pub fn builder() -> AgentBuilder {
+        AgentBuilder::default()
+    }
+
+    pub fn id(&self) -> &str {
+        &self.config.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    pub fn instructions(&self) -> &str {
+        &self.config.instructions
+    }
+
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
+    pub async fn generate(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut messages = Vec::new();
+        
+        // Add system instructions if present
+        if !self.config.instructions.is_empty() {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: self.config.instructions.clone(),
+            });
+        }
+
+        // Add user prompt
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
+
+        self.client.chat_completion(&self.config.model, messages, self.config.temperature).await
+    }
+}
+
+#[derive(Default)]
+pub struct AgentBuilder {
+    id: Option<String>,
+    name: Option<String>,
+    instructions: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    temperature: Option<f32>,
+}
+
+impl AgentBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
+    }
+
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    pub fn temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn build(self) -> Result<Agent, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = dotenvy::dotenv();
+
+        let model = self.model
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or_else(|| env::var("AGENT_MODEL").ok())
+            .unwrap_or_else(|| "openai/gpt-4o".to_string());
+
+        let config = AgentConfig {
+            id: self.id.unwrap_or_else(|| "default-agent".to_string()),
+            name: self.name.unwrap_or_else(|| "Agent".to_string()),
+            instructions: self.instructions.unwrap_or_default(),
+            model,
+            base_url: self.base_url,
+            api_key: self.api_key,
+            temperature: self.temperature,
+        };
+
+        Agent::new(config)
+    }
+}
