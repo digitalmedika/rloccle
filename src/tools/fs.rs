@@ -68,23 +68,36 @@ pub struct ListDirInput {
 
 #[derive(JsonSchema, Serialize, Debug)]
 pub struct ListDirOutput {
+    /// Up to the first 4 files/directories in the requested directory.
     pub entries: Vec<String>,
+    /// Number of additional files/directories that were not included in `entries`.
+    pub remaining_count: usize,
 }
 
 pub fn list_dir_tool() -> impl crate::Tool {
     create_tool::<ListDirInput, ListDirOutput, _, _>(
         "list_dir",
-        "Lists all files and directories in a given path",
+        "Lists up to 4 files and directories in a given path, plus the count of remaining entries",
         |args| async move {
+            const DISPLAY_LIMIT: usize = 4;
+
             let target_path = args.path.unwrap_or_else(|| ".".to_string());
-            let mut entries = Vec::new();
+            let mut all_entries = Vec::new();
             for entry in fs::read_dir(target_path)? {
                 let entry = entry?;
                 let path = entry.path();
                 let path_str = path.to_string_lossy().into_owned();
-                entries.push(path_str);
+                all_entries.push(path_str);
             }
-            Ok(ListDirOutput { entries })
+
+            let total_count = all_entries.len();
+            let remaining_count = total_count.saturating_sub(DISPLAY_LIMIT);
+            let entries = all_entries.into_iter().take(DISPLAY_LIMIT).collect();
+
+            Ok(ListDirOutput {
+                entries,
+                remaining_count,
+            })
         }
     )
 }

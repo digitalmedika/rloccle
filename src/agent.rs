@@ -6,6 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
+macro_rules! agent_println {
+    ($($arg:tt)*) => {
+        if std::env::var("LOCCLE_SILENT").is_err() {
+            println!($($arg)*);
+        }
+    };
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub id: String,
@@ -151,11 +159,7 @@ impl Agent {
 
             if !history.is_empty() {
                 let start_idx = if let Some(limit) = memory.config().last_messages {
-                    if history.len() > limit {
-                        history.len() - limit
-                    } else {
-                        0
-                    }
+                    get_safe_history_start_index(&history, limit)
                 } else {
                     0
                 };
@@ -229,7 +233,7 @@ impl Agent {
                     let tool_name = &tool_call.function.name;
                     let tool_args_str = &tool_call.function.arguments;
                     
-                    println!("Agent [{}] calling tool [{}] with arguments: {}", self.config.name, tool_name, tool_args_str);
+                    agent_println!("Agent [{}] calling tool [{}] with arguments: {}", self.config.name, tool_name, tool_args_str);
 
                     let result_str = if let Some(tool) = self.tools.get(tool_name) {
                         let args: serde_json::Value = serde_json::from_str(tool_args_str)
@@ -245,13 +249,13 @@ impl Agent {
                             match tool.execute(args).await {
                                 Ok(res) => res.to_string(),
                                 Err(e) => {
-                                    println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
+                                    agent_println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
                                     serde_json::json!({ "error": e.to_string() }).to_string()
                                 }
                             }
                         }).await
                     } else {
-                        println!("Tool [{}] not found", tool_name);
+                        agent_println!("Tool [{}] not found", tool_name);
                         serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
                     };
 
@@ -338,11 +342,7 @@ impl Agent {
 
             if !history.is_empty() {
                 let start_idx = if let Some(limit) = memory.config().last_messages {
-                    if history.len() > limit {
-                        history.len() - limit
-                    } else {
-                        0
-                    }
+                    get_safe_history_start_index(&history, limit)
                 } else {
                     0
                 };
@@ -757,7 +757,7 @@ impl AgentStream {
                             }
 
                             if let Err(err) = self.save_memory_if_needed().await {
-                                println!("Failed to save memory: {}", err);
+                                agent_println!("Failed to save memory: {}", err);
                             }
                             self.state = StreamState::Finished;
                             return Some(Ok(AgentStreamEvent::Finish {
@@ -790,7 +790,7 @@ impl AgentStream {
                         let tool_args_str = tool_call.function.arguments.clone();
                         let tool_id = tool_call.id.clone();
 
-                        println!("Agent [{}] calling tool [{}] with arguments: {}", self.agent_name, tool_name, tool_args_str);
+                        agent_println!("Agent [{}] calling tool [{}] with arguments: {}", self.agent_name, tool_name, tool_args_str);
 
                         let result_str = if let Some(tool) = self.tools.get(&tool_name) {
                             let args: serde_json::Value = serde_json::from_str(&tool_args_str)
@@ -806,13 +806,13 @@ impl AgentStream {
                                 match tool.execute(args).await {
                                     Ok(res) => res.to_string(),
                                     Err(e) => {
-                                        println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
+                                        agent_println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
                                         serde_json::json!({ "error": e.to_string() }).to_string()
                                     }
                                 }
                             }).await
                         } else {
-                            println!("Tool [{}] not found", tool_name);
+                            agent_println!("Tool [{}] not found", tool_name);
                             serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
                         };
 
@@ -838,4 +838,20 @@ impl AgentStream {
             }
         }
     }
+}
+
+fn get_safe_history_start_index(history: &[ChatMessage], limit: usize) -> usize {
+    if history.len() <= limit {
+        return 0;
+    }
+    
+    let mut start_idx = history.len() - limit;
+    
+    // Scan backwards to ensure we don't start with a 'tool' role message.
+    // A 'tool' message must always be preceded by the corresponding 'assistant' message that declared the tool call.
+    while start_idx > 0 && history[start_idx].role == "tool" {
+        start_idx -= 1;
+    }
+    
+    start_idx
 }
