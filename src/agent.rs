@@ -1,5 +1,8 @@
-use crate::openai::{ChatMessage, OpenAIClient};
+use crate::openai::{ChatMessage, OpenAIClient, OpenAITool, OpenAIFunction};
+use crate::tool::Tool;
 use std::env;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -29,10 +32,18 @@ impl Default for AgentConfig {
 pub struct Agent {
     config: AgentConfig,
     client: OpenAIClient,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl Agent {
-    pub fn new(mut config: AgentConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(config: AgentConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_tools(config, HashMap::new())
+    }
+
+    pub fn new_with_tools(
+        mut config: AgentConfig,
+        tools: HashMap<String, Arc<dyn Tool>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let _ = dotenvy::dotenv();
 
         if config.model.is_empty() {
@@ -58,7 +69,7 @@ impl Agent {
             });
 
         let client = OpenAIClient::new(base_url, api_key);
-        Ok(Self { config, client })
+        Ok(Self { config, client, tools })
     }
 
     pub fn builder() -> AgentBuilder {
@@ -86,19 +97,98 @@ impl Agent {
         
         // Add system instructions if present
         if !self.config.instructions.is_empty() {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: self.config.instructions.clone(),
-            });
+            messages.push(ChatMessage::system(self.config.instructions.clone()));
         }
 
         // Add user prompt
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        });
+        messages.push(ChatMessage::user(prompt));
 
-        self.client.chat_completion(&self.config.model, messages, self.config.temperature).await
+        // Construct OpenAI tools specification
+        let tools_spec: Option<Vec<OpenAITool>> = if self.tools.is_empty() {
+            None
+        } else {
+            Some(
+                self.tools
+                    .values()
+                    .map(|tool| OpenAITool {
+                        r#type: "function".to_string(),
+                        function: OpenAIFunction {
+                            name: tool.id().to_string(),
+                            description: tool.description().to_string(),
+                            parameters: tool.input_schema(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        let mut steps = 0;
+        let max_steps = 5;
+
+        loop {
+            if steps >= max_steps {
+                return Err("Exceeded maximum tool execution steps".into());
+            }
+
+            // Call LLM with current messages and tools
+            let response = self
+                .client
+                .chat_completion_raw(
+                    &self.config.model,
+                    messages.clone(),
+                    self.config.temperature,
+                    tools_spec.clone(),
+                )
+                .await?;
+
+            // If there are tool calls, we execute them
+            if let Some(ref tool_calls) = response.tool_calls {
+                if tool_calls.is_empty() {
+                    // No tool calls, return text response if any
+                    return Ok(response.content.unwrap_or_default());
+                }
+
+                // Add assistant's message (which contains the tool calls) to the history
+                messages.push(response.clone());
+
+                // Execute each tool call
+                for tool_call in tool_calls {
+                    let tool_name = &tool_call.function.name;
+                    let tool_args_str = &tool_call.function.arguments;
+                    
+                    println!("Agent [{}] calling tool [{}] with arguments: {}", self.config.name, tool_name, tool_args_str);
+
+                    let result_str = if let Some(tool) = self.tools.get(tool_name) {
+                        // Parse arguments as JSON Value
+                        let args: serde_json::Value = serde_json::from_str(tool_args_str)
+                            .unwrap_or(serde_json::Value::Null);
+                        
+                        match tool.execute(args).await {
+                            Ok(res) => res.to_string(),
+                            Err(e) => {
+                                println!("Error executing tool [{}]: {}", tool_name, e);
+                                serde_json::json!({ "error": e.to_string() }).to_string()
+                            }
+                        }
+                    } else {
+                        println!("Tool [{}] not found", tool_name);
+                        serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
+                    };
+
+                    // Add tool response to history
+                    messages.push(ChatMessage::tool(
+                        tool_call.id.clone(),
+                        tool_name.clone(),
+                        result_str,
+                    ));
+                }
+
+                steps += 1;
+            } else {
+                // If no tool calls, return text response
+                return Ok(response.content.unwrap_or_default());
+            }
+        }
     }
 }
 
@@ -111,6 +201,7 @@ pub struct AgentBuilder {
     base_url: Option<String>,
     api_key: Option<String>,
     temperature: Option<f32>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl AgentBuilder {
@@ -153,6 +244,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, Box<dyn std::error::Error + Send + Sync>> {
         let _ = dotenvy::dotenv();
 
@@ -171,6 +272,11 @@ impl AgentBuilder {
             temperature: self.temperature,
         };
 
-        Agent::new(config)
+        let mut tools_map = HashMap::new();
+        for t in self.tools {
+            tools_map.insert(t.id().to_string(), t);
+        }
+
+        Agent::new_with_tools(config, tools_map)
     }
 }

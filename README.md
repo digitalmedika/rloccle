@@ -7,7 +7,8 @@ An ergonomic, lightweight AI Agent framework for Rust, heavily inspired by [Mast
 - 🚀 **TypeScript-like Syntax**: Define agents using the declarative `agent!` macro, reducing Rust builder boilerplate.
 - 🔌 **OpenAI-Compatible Client**: Works out-of-the-box with OpenAI, OpenRouter, Ollama, LM Studio, Cherry Studio, and other compatible gateways.
 - ⚙️ **Automatic Env Resolution**: Loads API keys (`OPENAI_API_KEY`), model names (`OPENAI_MODEL`/`AGENT_MODEL`), and base URLs (`OPENAI_BASE_URL`/`OPENAI_API_BASE`) automatically from your `.env` file.
-- 🛠️ **Smart Route Normalization**: Automatically ensures API endpoints correctly map to `/v1/chat/completions`, even if you omit the version suffix in the URL.
+- 🛠️ **Type-Safe Struct-based Tools**: Define LLM tools using standard Rust structs. The JSON Schema is automatically generated via `schemars` (including parameter descriptions from doc comments), and Serde validates types at runtime.
+- 🔄 **Autonomous Reasoning Loop**: The agent automatically runs an execution loop to execute tools called by the LLM and feeds results back in real-time.
 - 🧹 **SSE Response Sanitization**: Gracefully handles and strips trailing streaming endings (e.g., `data: [DONE]`) returned by certain model proxies, preventing JSON parsing crashes.
 
 ---
@@ -35,6 +36,49 @@ let test_agent = agent! {
     name: "Test Agent",
     instructions: "You are a helpful assistant.",
     model: "openai/gpt-4o",
+};
+```
+
+---
+
+## Using Tools
+
+You can define tools using input and output structs, and pass them to agents. The agent will automatically call them when requested by the model:
+
+```rust
+use loccle::{agent, create_tool, Tool};
+use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use std::sync::Arc;
+
+// 1. Define input/output structs
+#[derive(JsonSchema, Deserialize)]
+pub struct WeatherInput {
+    /// The city and state, e.g. San Francisco, CA
+    pub location: String,
+}
+
+#[derive(JsonSchema, Serialize)]
+pub struct WeatherOutput {
+    pub weather: String,
+}
+
+// 2. Define the tool with auto schema generation
+let weather_tool = create_tool::<WeatherInput, WeatherOutput, _, _>(
+    "weather-tool",
+    "Fetches weather for a location",
+    |args| async move {
+        let weather_info = format!("Weather in {} is sunny and 72°F", args.location);
+        Ok(WeatherOutput { weather: weather_info })
+    }
+);
+
+// 3. Register tool with agent!
+let weather_agent = agent! {
+    id: "weather-agent",
+    name: "Weather Assistant",
+    instructions: "Use weather-tool to get current weather data.",
+    tools: vec![Arc::new(weather_tool) as Arc<dyn Tool>],
 };
 ```
 
@@ -102,7 +146,7 @@ cargo run --example simple_agent
 ## Future Roadmap
 
 This framework aims to build out full agentic capabilities in Rust:
-- [ ] **Tools & Tool Calling**: Implement a decorator or macro system to register local Rust functions as LLM-callable tools.
+- [x] **Tools & Tool Calling**: Type-safe automatic schema generation (`schemars` + `serde`) and autonomous reasoning/execution loop.
 - [ ] **Workflows**: Add step-based async DAG workflows with state transmission, retry mechanisms, and branching logic.
 - [ ] **Memory & Threads**: Implement short-term state storage and long-term conversation thread management.
 - [ ] **Vector DB Integrations**: Support native semantic search and RAG indexing.

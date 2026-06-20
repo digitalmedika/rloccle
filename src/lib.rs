@@ -1,7 +1,9 @@
 pub mod agent;
 pub mod openai;
+pub mod tool;
 
 pub use agent::{Agent, AgentBuilder, AgentConfig};
+pub use tool::{Tool, TypedTool, create_tool, BoxError, BoxFuture};
 
 #[macro_export]
 macro_rules! agent {
