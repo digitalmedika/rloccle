@@ -5,10 +5,11 @@ pub mod tools;
 pub mod storage;
 pub mod memory;
 
-pub use agent::{Agent, AgentBuilder, AgentConfig, AgentStream, AgentStreamEvent, GenerateOptions};
+pub use agent::{Agent, AgentBuilder, AgentConfig, AgentStream, AgentStreamEvent, GenerateOptions, TaskSignalProvider};
 pub use tool::{Tool, TypedTool, create_tool, BoxError, BoxFuture};
 pub use storage::{Storage, InMemoryStorage, FileStorage, ThreadSession};
 pub use memory::{Memory, MemoryConfig};
+pub use tools::task::{Task, ExecutionContext, CURRENT_CONTEXT, TaskCheckOutput, TaskWriteOutput, TaskUpdateOutput, TaskCompleteOutput, TaskInput};
 
 #[macro_export]
 macro_rules! agent {

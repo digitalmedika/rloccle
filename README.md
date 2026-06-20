@@ -204,6 +204,59 @@ In Rust, overloading method names or using optional arguments isn't supported na
 
 ---
 
+## Task Lists & Signal Provider
+
+`loccle-rs` includes a durable, structured task-tracking system mirroring Mastra's `TaskSignalProvider` and `TaskStateProcessor`.
+
+By registering a `TaskSignalProvider` with an agent, the agent gains:
+1. **Durable Task Storage**: Tasks are saved in the thread-scoped state storage map and persist across stream turns.
+2. **Automatic State Projection**: The current active tasks list is automatically formatted as an XML block and injected into the agent's system message on every execution turn.
+3. **Built-in Task Tools**: Exposes four new tools to the agent's toolset:
+   - `task_write`: Initialize or overwrite the task list.
+   - `task_update`: Update a task's content, status (e.g. `pending`, `in_progress`, `completed`), or `activeForm` (present continuous description of the work).
+   - `task_complete`: Mark a specific task completed by ID.
+   - `task_check`: Check list status and overall completion.
+
+### Usage Example
+
+```rust
+use loccle::{agent, Memory, MemoryConfig, FileStorage, GenerateOptions, TaskSignalProvider};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let storage = Arc::new(FileStorage::new("./target/memory_dir"));
+    let memory = Memory::new(storage, MemoryConfig::default());
+
+    // Register TaskSignalProvider using `.signal()`
+    let task_agent = agent! {
+        id: "task-coordinator",
+        name: "Task Coordinator",
+        instructions: "Plan and coordinate tasks. Use task tools to update your progress.",
+        memory: memory,
+        signal: TaskSignalProvider::new(), // Registers tools and state projection
+    };
+
+    let options = GenerateOptions::new()
+        .thread_id("thread-123")
+        .resource_id("user-1");
+
+    // Start execution. The agent will plan tasks using `task_write` and update their status dynamically!
+    let mut stream = task_agent.stream_with_options("Research top 3 Rust databases, compare them, and verify.", options).await.unwrap();
+    
+    while let Some(event_res) = stream.next().await {
+        // Handle delta, tool calls and results...
+    }
+}
+```
+
+To run the live task tracking agent example:
+```bash
+cargo run --example task_agent
+```
+
+---
+
 ## Built-in Tools
 
 Loccle comes with pre-packaged filesystem and system tools to make building agents easy.

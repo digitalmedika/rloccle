@@ -36,6 +36,7 @@ pub struct Agent {
     client: OpenAIClient,
     tools: HashMap<String, Arc<dyn Tool>>,
     memory: Option<Memory>,
+    task_signal_provider: bool,
 }
 
 impl Agent {
@@ -72,7 +73,7 @@ impl Agent {
             });
 
         let client = OpenAIClient::new(base_url, api_key);
-        Ok(Self { config, client, tools, memory: None })
+        Ok(Self { config, client, tools, memory: None, task_signal_provider: false })
     }
 
     pub fn builder() -> AgentBuilder {
@@ -95,6 +96,14 @@ impl Agent {
         &self.config.model
     }
 
+    pub fn tools(&self) -> &HashMap<String, Arc<dyn Tool>> {
+        &self.tools
+    }
+
+    pub fn memory(&self) -> Option<&Memory> {
+        self.memory.as_ref()
+    }
+
     pub async fn generate(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.generate_with_options(prompt, GenerateOptions::default()).await
     }
@@ -115,6 +124,29 @@ impl Agent {
             
             if !self.config.instructions.is_empty() {
                 messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+
+            if self.task_signal_provider {
+                if let Ok(Some(session)) = memory.storage().get_thread(thread_id).await {
+                    if let Some(tasks_val) = session.state.get("tasks") {
+                        if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(tasks_val.clone()) {
+                            if !tasks.is_empty() {
+                                let mut tasks_xml = String::from("<tasks>\n");
+                                for task in &tasks {
+                                    tasks_xml.push_str(&format!(
+                                        "  <task id=\"{}\" status=\"{}\" activeForm=\"{}\">{}</task>\n",
+                                        task.id, task.status, task.active_form, task.content
+                                    ));
+                                }
+                                tasks_xml.push_str("</tasks>");
+                                messages.push(ChatMessage::system(format!(
+                                    "Here is the list of tasks currently tracked for this thread:\n{}",
+                                    tasks_xml
+                                )));
+                            }
+                        }
+                    }
+                }
             }
 
             if !history.is_empty() {
@@ -165,7 +197,7 @@ impl Agent {
         };
 
         let mut steps = 0;
-        let max_steps = 5;
+        let max_steps = 15;
 
         let final_content = loop {
             if steps >= max_steps {
@@ -203,13 +235,21 @@ impl Agent {
                         let args: serde_json::Value = serde_json::from_str(tool_args_str)
                             .unwrap_or(serde_json::Value::Null);
                         
-                        match tool.execute(args).await {
-                            Ok(res) => res.to_string(),
-                            Err(e) => {
-                                println!("Error executing tool [{}]: {}", tool_name, e);
-                                serde_json::json!({ "error": e.to_string() }).to_string()
+                        let context = crate::tools::task::ExecutionContext {
+                            thread_id: options.thread_id.clone(),
+                            resource_id: options.resource_id.clone(),
+                            memory: self.memory.clone(),
+                        };
+                        let tool_name_for_scope = tool_name.clone();
+                        crate::tools::task::CURRENT_CONTEXT.scope(context, async move {
+                            match tool.execute(args).await {
+                                Ok(res) => res.to_string(),
+                                Err(e) => {
+                                    println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
+                                    serde_json::json!({ "error": e.to_string() }).to_string()
+                                }
                             }
-                        }
+                        }).await
                     } else {
                         println!("Tool [{}] not found", tool_name);
                         serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
@@ -237,10 +277,11 @@ impl Agent {
             let memory = self.memory.as_ref().unwrap();
             let thread_id = options.thread_id.as_ref().unwrap();
             
-            let mut full_history = memory.storage().get_messages(thread_id).await?;
-            if full_history.is_empty() {
+            let thread_exists = memory.storage().get_thread(thread_id).await?.is_some();
+            if !thread_exists {
                 memory.storage().create_thread(thread_id, options.resource_id.clone()).await?;
             }
+            let mut full_history = memory.storage().get_messages(thread_id).await?;
 
             let new_messages = &messages[user_prompt_index..];
             full_history.extend(new_messages.iter().cloned());
@@ -262,15 +303,38 @@ impl Agent {
         let mut messages = Vec::new();
         
         let has_memory_and_thread = self.memory.is_some() && options.thread_id.is_some();
-        let user_prompt_index = if has_memory_and_thread {
-            let memory = self.memory.as_ref().unwrap();
-            let thread_id = options.thread_id.as_ref().unwrap();
-            
-            let history = memory.storage().get_messages(thread_id).await?;
-            
-            if !self.config.instructions.is_empty() {
-                messages.push(ChatMessage::system(self.config.instructions.clone()));
-            }
+            let user_prompt_index = if has_memory_and_thread {
+                let memory = self.memory.as_ref().unwrap();
+                let thread_id = options.thread_id.as_ref().unwrap();
+                
+                let history = memory.storage().get_messages(thread_id).await?;
+                
+                if !self.config.instructions.is_empty() {
+                    messages.push(ChatMessage::system(self.config.instructions.clone()));
+                }
+
+                if self.task_signal_provider {
+                    if let Ok(Some(session)) = memory.storage().get_thread(thread_id).await {
+                        if let Some(tasks_val) = session.state.get("tasks") {
+                            if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(tasks_val.clone()) {
+                                if !tasks.is_empty() {
+                                    let mut tasks_xml = String::from("<tasks>\n");
+                                    for task in &tasks {
+                                        tasks_xml.push_str(&format!(
+                                            "  <task id=\"{}\" status=\"{}\" activeForm=\"{}\">{}</task>\n",
+                                            task.id, task.status, task.active_form, task.content
+                                        ));
+                                    }
+                                    tasks_xml.push_str("</tasks>");
+                                    messages.push(ChatMessage::system(format!(
+                                        "Here is the list of tasks currently tracked for this thread:\n{}",
+                                        tasks_xml
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
 
             if !history.is_empty() {
                 let start_idx = if let Some(limit) = memory.config().last_messages {
@@ -327,7 +391,7 @@ impl Agent {
             tools: self.tools.clone(),
             tools_spec,
             steps: 0,
-            max_steps: 5,
+            max_steps: 15,
             state: StreamState::Init,
             memory: self.memory.clone(),
             thread_id: options.thread_id,
@@ -348,6 +412,15 @@ pub struct AgentBuilder {
     temperature: Option<f32>,
     tools: Vec<Arc<dyn Tool>>,
     memory: Option<Memory>,
+    task_signal_provider: bool,
+}
+
+pub struct TaskSignalProvider;
+
+impl TaskSignalProvider {
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl AgentBuilder {
@@ -405,6 +478,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn signal(mut self, _provider: TaskSignalProvider) -> Self {
+        self.task_signal_provider = true;
+        self
+    }
+
+    pub fn signals(mut self, _providers: Vec<TaskSignalProvider>) -> Self {
+        self.task_signal_provider = true;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, Box<dyn std::error::Error + Send + Sync>> {
         let _ = dotenvy::dotenv();
 
@@ -427,8 +510,14 @@ impl AgentBuilder {
         for t in self.tools {
             tools_map.insert(t.id().to_string(), t);
         }
+        if self.task_signal_provider {
+            for t in crate::tools::all_task_tools() {
+                tools_map.insert(t.id().to_string(), t.clone());
+            }
+        }
         let mut agent = Agent::new_with_tools(config, tools_map)?;
         agent.memory = self.memory;
+        agent.task_signal_provider = self.task_signal_provider;
         Ok(agent)
     }
 }
@@ -526,10 +615,11 @@ pub struct AgentStream {
 impl AgentStream {
     async fn save_memory_if_needed(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let (Some(memory), Some(thread_id)) = (&self.memory, &self.thread_id) {
-            let mut full_history = memory.storage().get_messages(thread_id).await?;
-            if full_history.is_empty() {
+            let thread_exists = memory.storage().get_thread(thread_id).await?.is_some();
+            if !thread_exists {
                 memory.storage().create_thread(thread_id, self.resource_id.clone()).await?;
             }
+            let mut full_history = memory.storage().get_messages(thread_id).await?;
 
             let new_messages = &self.messages[self.user_prompt_index..];
             full_history.extend(new_messages.iter().cloned());
@@ -706,13 +796,21 @@ impl AgentStream {
                             let args: serde_json::Value = serde_json::from_str(&tool_args_str)
                                 .unwrap_or(serde_json::Value::Null);
                             
-                            match tool.execute(args).await {
-                                Ok(res) => res.to_string(),
-                                Err(e) => {
-                                    println!("Error executing tool [{}]: {}", tool_name, e);
-                                    serde_json::json!({ "error": e.to_string() }).to_string()
+                            let context = crate::tools::task::ExecutionContext {
+                                thread_id: self.thread_id.clone(),
+                                resource_id: self.resource_id.clone(),
+                                memory: self.memory.clone(),
+                            };
+                            let tool_name_for_scope = tool_name.clone();
+                            crate::tools::task::CURRENT_CONTEXT.scope(context, async move {
+                                match tool.execute(args).await {
+                                    Ok(res) => res.to_string(),
+                                    Err(e) => {
+                                        println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
+                                        serde_json::json!({ "error": e.to_string() }).to_string()
+                                    }
                                 }
-                            }
+                            }).await
                         } else {
                             println!("Tool [{}] not found", tool_name);
                             serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()

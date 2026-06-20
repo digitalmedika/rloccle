@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod system;
+pub mod task;
 
 use std::sync::Arc;
 use crate::tool::Tool;
@@ -26,5 +27,16 @@ pub fn all_system_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(system::execute_command_tool()),
         Arc::new(system::get_process_output_tool()),
         Arc::new(system::kill_process_tool()),
+    ]
+}
+
+/// Returns all built-in task list tools (task_write, task_update, task_complete, task_check)
+/// as a Vector of Arc<dyn Tool>.
+pub fn all_task_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(task::task_write_tool()),
+        Arc::new(task::task_update_tool()),
+        Arc::new(task::task_complete_tool()),
+        Arc::new(task::task_check_tool()),
     ]
 }
