@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod openai;
 pub mod tool;
+pub mod tools;
 
 pub use agent::{Agent, AgentBuilder, AgentConfig};
 pub use tool::{Tool, TypedTool, create_tool, BoxError, BoxFuture};
