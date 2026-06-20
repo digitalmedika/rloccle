@@ -3,7 +3,7 @@ pub mod openai;
 pub mod tool;
 pub mod tools;
 
-pub use agent::{Agent, AgentBuilder, AgentConfig};
+pub use agent::{Agent, AgentBuilder, AgentConfig, AgentStream, AgentStreamEvent};
 pub use tool::{Tool, TypedTool, create_tool, BoxError, BoxFuture};
 
 #[macro_export]

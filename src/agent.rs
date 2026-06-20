@@ -1,8 +1,9 @@
-use crate::openai::{ChatMessage, OpenAIClient, OpenAITool, OpenAIFunction};
+use crate::openai::{ChatMessage, OpenAIClient, OpenAITool, OpenAIFunction, ToolCall, FunctionCall, OpenAIStream};
 use crate::tool::Tool;
 use std::env;
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -190,6 +191,46 @@ impl Agent {
             }
         }
     }
+
+    pub async fn stream(&self, prompt: &str) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
+        let mut messages = Vec::new();
+        
+        if !self.config.instructions.is_empty() {
+            messages.push(ChatMessage::system(self.config.instructions.clone()));
+        }
+        messages.push(ChatMessage::user(prompt));
+
+        let tools_spec: Option<Vec<OpenAITool>> = if self.tools.is_empty() {
+            None
+        } else {
+            Some(
+                self.tools
+                    .values()
+                    .map(|tool| OpenAITool {
+                        r#type: "function".to_string(),
+                        function: OpenAIFunction {
+                            name: tool.id().to_string(),
+                            description: tool.description().to_string(),
+                            parameters: tool.input_schema(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        Ok(AgentStream {
+            client: self.client.clone(),
+            model: self.config.model.clone(),
+            agent_name: self.config.name.clone(),
+            messages,
+            temperature: self.config.temperature,
+            tools: self.tools.clone(),
+            tools_spec,
+            steps: 0,
+            max_steps: 5,
+            state: StreamState::Init,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -276,7 +317,270 @@ impl AgentBuilder {
         for t in self.tools {
             tools_map.insert(t.id().to_string(), t);
         }
-
         Agent::new_with_tools(config, tools_map)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum AgentStreamEvent {
+    #[serde(rename = "text-delta")]
+    TextDelta(String),
+    #[serde(rename = "reasoning-delta")]
+    ReasoningDelta(String),
+    #[serde(rename = "tool-call")]
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "tool-result")]
+    ToolResult {
+        id: String,
+        name: String,
+        result: String,
+    },
+    #[serde(rename = "finish")]
+    Finish {
+        finish_reason: Option<String>,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct AccumulatedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+enum StreamState {
+    Init,
+    StreamingLLM {
+        stream: OpenAIStream,
+        accumulated_content: String,
+        accumulated_reasoning: String,
+        accumulated_tool_calls: Vec<AccumulatedToolCall>,
+    },
+    ExecutingTools {
+        tool_calls: Vec<ToolCall>,
+        index: usize,
+        yielded_call: bool,
+    },
+    Finished,
+}
+
+pub struct AgentStream {
+    client: OpenAIClient,
+    model: String,
+    agent_name: String,
+    messages: Vec<ChatMessage>,
+    temperature: Option<f32>,
+    tools: HashMap<String, Arc<dyn Tool>>,
+    tools_spec: Option<Vec<OpenAITool>>,
+    steps: usize,
+    max_steps: usize,
+    state: StreamState,
+}
+
+impl AgentStream {
+    pub async fn next(&mut self) -> Option<Result<AgentStreamEvent, Box<dyn std::error::Error + Send + Sync>>> {
+        loop {
+            match &mut self.state {
+                StreamState::Init => {
+                    if self.steps >= self.max_steps {
+                        self.state = StreamState::Finished;
+                        return Some(Err("Exceeded maximum tool execution steps".into()));
+                    }
+
+                    let stream_res = self.client.chat_completion_stream(
+                        &self.model,
+                        self.messages.clone(),
+                        self.temperature,
+                        self.tools_spec.clone(),
+                    ).await;
+
+                    match stream_res {
+                        Ok(openai_stream) => {
+                            self.state = StreamState::StreamingLLM {
+                                stream: openai_stream,
+                                accumulated_content: String::new(),
+                                accumulated_reasoning: String::new(),
+                                accumulated_tool_calls: Vec::new(),
+                            };
+                        }
+                        Err(e) => {
+                            self.state = StreamState::Finished;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+                StreamState::StreamingLLM {
+                    stream,
+                    accumulated_content,
+                    accumulated_reasoning,
+                    accumulated_tool_calls,
+                } => {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            let mut text_delta = None;
+                            let mut reasoning_delta = None;
+
+                            for choice in &chunk.choices {
+                                if let Some(ref content) = choice.delta.content {
+                                    accumulated_content.push_str(content);
+                                    text_delta = Some(content.clone());
+                                }
+                                if let Some(ref reasoning) = choice.delta.reasoning_content {
+                                    accumulated_reasoning.push_str(reasoning);
+                                    reasoning_delta = Some(reasoning.clone());
+                                }
+                                if let Some(ref tool_calls) = choice.delta.tool_calls {
+                                    for delta in tool_calls {
+                                        let idx = delta.index as usize;
+                                        while accumulated_tool_calls.len() <= idx {
+                                            accumulated_tool_calls.push(AccumulatedToolCall {
+                                                id: String::new(),
+                                                name: String::new(),
+                                                arguments: String::new(),
+                                            });
+                                        }
+                                        if let Some(id) = &delta.id {
+                                            accumulated_tool_calls[idx].id = id.clone();
+                                        }
+                                        if let Some(func) = &delta.function {
+                                            if let Some(name) = &func.name {
+                                                accumulated_tool_calls[idx].name = name.clone();
+                                            }
+                                            if let Some(args) = &func.arguments {
+                                                accumulated_tool_calls[idx].arguments.push_str(args);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(text) = text_delta {
+                                return Some(Ok(AgentStreamEvent::TextDelta(text)));
+                            }
+                            if let Some(reasoning) = reasoning_delta {
+                                return Some(Ok(AgentStreamEvent::ReasoningDelta(reasoning)));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            self.state = StreamState::Finished;
+                            return Some(Err(e));
+                        }
+                        None => {
+                            let (content, _reasoning, tool_calls) = match std::mem::replace(&mut self.state, StreamState::Init) {
+                                StreamState::StreamingLLM {
+                                    accumulated_content,
+                                    accumulated_reasoning,
+                                    accumulated_tool_calls,
+                                    ..
+                                } => (accumulated_content, accumulated_reasoning, accumulated_tool_calls),
+                                _ => unreachable!(),
+                            };
+
+                            let assistant_content = if content.is_empty() { None } else { Some(content) };
+                            
+                            let open_tool_calls = if tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(tool_calls.iter().map(|tc| ToolCall {
+                                    id: tc.id.clone(),
+                                    r#type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: tc.name.clone(),
+                                        arguments: tc.arguments.clone(),
+                                    },
+                                }).collect::<Vec<_>>())
+                            };
+
+                            self.messages.push(ChatMessage::assistant(assistant_content, open_tool_calls.clone()));
+
+                            if let Some(calls) = open_tool_calls {
+                                if !calls.is_empty() {
+                                    self.state = StreamState::ExecutingTools {
+                                        tool_calls: calls,
+                                        index: 0,
+                                        yielded_call: false,
+                                    };
+                                    continue;
+                                }
+                            }
+
+                            self.state = StreamState::Finished;
+                            return Some(Ok(AgentStreamEvent::Finish {
+                                finish_reason: Some("stop".to_string()),
+                                prompt_tokens: None,
+                                completion_tokens: None,
+                                total_tokens: None,
+                            }));
+                        }
+                    }
+                }
+                StreamState::ExecutingTools { tool_calls, index, yielded_call } => {
+                    let idx = *index;
+                    if idx >= tool_calls.len() {
+                        self.steps += 1;
+                        self.state = StreamState::Init;
+                        continue;
+                    }
+
+                    let tool_call = &tool_calls[idx];
+                    if !*yielded_call {
+                        *yielded_call = true;
+                        return Some(Ok(AgentStreamEvent::ToolCall {
+                            id: tool_call.id.clone(),
+                            name: tool_call.function.name.clone(),
+                            arguments: tool_call.function.arguments.clone(),
+                        }));
+                    } else {
+                        let tool_name = tool_call.function.name.clone();
+                        let tool_args_str = tool_call.function.arguments.clone();
+                        let tool_id = tool_call.id.clone();
+
+                        println!("Agent [{}] calling tool [{}] with arguments: {}", self.agent_name, tool_name, tool_args_str);
+
+                        let result_str = if let Some(tool) = self.tools.get(&tool_name) {
+                            let args: serde_json::Value = serde_json::from_str(&tool_args_str)
+                                .unwrap_or(serde_json::Value::Null);
+                            
+                            match tool.execute(args).await {
+                                Ok(res) => res.to_string(),
+                                Err(e) => {
+                                    println!("Error executing tool [{}]: {}", tool_name, e);
+                                    serde_json::json!({ "error": e.to_string() }).to_string()
+                                }
+                            }
+                        } else {
+                            println!("Tool [{}] not found", tool_name);
+                            serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
+                        };
+
+                        self.messages.push(ChatMessage::tool(
+                            tool_id.clone(),
+                            tool_name.clone(),
+                            result_str.clone(),
+                        ));
+
+                        *index += 1;
+                        *yielded_call = false;
+
+                        return Some(Ok(AgentStreamEvent::ToolResult {
+                            id: tool_id,
+                            name: tool_name,
+                            result: result_str,
+                        }));
+                    }
+                }
+                StreamState::Finished => {
+                    return None;
+                }
+            }
+        }
     }
 }

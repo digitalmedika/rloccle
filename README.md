@@ -86,6 +86,72 @@ let weather_agent = agent! {
 
 ---
 
+## Streaming Responses
+
+Similar to Mastra, `loccle-rs` supports real-time streaming response delivery using an async event stream. You can call `.stream(prompt)` on an agent to receive an `AgentStream` and iterate over `AgentStreamEvent` items chunk-by-chunk using `.next().await`.
+
+The streaming parser automatically runs the tool execution reasoning loops and emits intermediate events so your client application can distinguish what the agent is doing in real-time.
+
+### Event Types (`AgentStreamEvent`)
+- `TextDelta(String)`: Incremental assistant response text.
+- `ReasoningDelta(String)`: Incremental reasoning/thinking trace (e.g., for o1/o3-mini/DeepSeek models).
+- `ToolCall`: Emitted when the agent decides to invoke a tool, containing the tool ID, name, and final arguments.
+- `ToolResult`: Emitted when the tool execution completes, containing the tool ID, name, and result string.
+- `Finish`: Emitted when the agent finishes streaming.
+
+### Usage Example
+
+```rust
+use loccle::{agent, AgentStreamEvent};
+use std::io::Write;
+
+#[tokio::main]
+async fn main() {
+    let assistant = agent! {
+        id: "stream-agent",
+        name: "Streaming Helper",
+        instructions: "You are a helpful assistant.",
+    };
+
+    match assistant.stream("Explain Rust ownership in one short paragraph.").await {
+        Ok(mut stream) => {
+            while let Some(event_res) = stream.next().await {
+                match event_res {
+                    Ok(event) => match event {
+                        AgentStreamEvent::TextDelta(text) => {
+                            print!("{}", text);
+                            let _ = std::io::stdout().flush();
+                        }
+                        AgentStreamEvent::ReasoningDelta(reasoning) => {
+                            print!("[Thinking: {}]", reasoning);
+                            let _ = std::io::stdout().flush();
+                        }
+                        AgentStreamEvent::ToolCall { name, .. } => {
+                            println!("\n[Agent is running tool: {}]", name);
+                        }
+                        AgentStreamEvent::ToolResult { result, .. } => {
+                            println!("\n[Tool returned: {}]", result);
+                        }
+                        AgentStreamEvent::Finish { .. } => {
+                            println!("\n[Done]");
+                        }
+                    }
+                    Err(e) => eprintln!("Error in stream: {}", e),
+                }
+            }
+        }
+        Err(err) => eprintln!("Failed to initiate stream: {}", err),
+    }
+}
+```
+
+To run the streaming demo:
+```bash
+cargo run --example streaming_agent
+```
+
+---
+
 ## Built-in Tools
 
 Loccle comes with pre-packaged filesystem and system tools to make building agents easy.
@@ -193,6 +259,7 @@ cargo run --example simple_agent
 
 This framework aims to build out full agentic capabilities in Rust:
 - [x] **Tools & Tool Calling**: Type-safe automatic schema generation (`schemars` + `serde`) and autonomous reasoning/execution loop.
+- [x] **Streaming Responses**: Real-time response deltas (text & reasoning) and step-by-step tool execution streams.
 - [ ] **Workflows**: Add step-based async DAG workflows with state transmission, retry mechanisms, and branching logic.
 - [ ] **Memory & Threads**: Implement short-term state storage and long-term conversation thread management.
 - [ ] **Vector DB Integrations**: Support native semantic search and RAG indexing.

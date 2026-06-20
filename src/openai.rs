@@ -89,6 +89,8 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +103,162 @@ struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChunkChoice>,
+    pub usage: Option<CompletionUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChatCompletionChunkChoice {
+    pub index: u64,
+    pub delta: ChatCompletionChunkDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChatCompletionChunkDelta {
+    pub role: Option<String>,
+    pub content: Option<String>,
+    #[serde(rename = "reasoning_content")]
+    pub reasoning_content: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolCallDelta {
+    pub index: u64,
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FunctionCallDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CompletionUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+struct LineDecoder {
+    buffer: Vec<u8>,
+    lines: std::collections::VecDeque<String>,
+}
+
+impl LineDecoder {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            lines: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes = self.buffer.drain(..=pos).collect::<Vec<u8>>();
+            let mut line = String::from_utf8_lossy(&line_bytes).into_owned();
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            self.lines.push_back(line);
+        }
+    }
+
+    fn pop_line(&mut self) -> Option<String> {
+        self.lines.pop_front()
+    }
+}
+
+pub struct OpenAIStream {
+    response: reqwest::Response,
+    decoder: LineDecoder,
+    done: bool,
+}
+
+impl OpenAIStream {
+    pub fn new(response: reqwest::Response) -> Self {
+        Self {
+            response,
+            decoder: LineDecoder::new(),
+            done: false,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<ChatCompletionChunk, Box<dyn std::error::Error + Send + Sync>>> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            if let Some(line) = self.decoder.pop_line() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if trimmed.starts_with("data: ") {
+                    let data = &trimmed[6..];
+                    if data == "[DONE]" {
+                        self.done = true;
+                        return None;
+                    }
+
+                    match serde_json::from_str::<ChatCompletionChunk>(data) {
+                        Ok(chunk) => return Some(Ok(chunk)),
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(format!(
+                                "Failed to parse stream chunk JSON: {}. Raw data: {}",
+                                e, data
+                            ).into()));
+                        }
+                    }
+                }
+            }
+
+            match self.response.chunk().await {
+                Ok(Some(bytes)) => {
+                    self.decoder.feed(&bytes);
+                }
+                Ok(None) => {
+                    if !self.decoder.buffer.is_empty() {
+                        let remaining = std::mem::take(&mut self.decoder.buffer);
+                        let mut line = String::from_utf8_lossy(&remaining).into_owned();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                        if !line.is_empty() {
+                            self.decoder.lines.push_back(line);
+                            continue;
+                        }
+                    }
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(Box::new(e)));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct OpenAIClient {
     base_url: String,
     api_key: String,
@@ -158,6 +316,7 @@ impl OpenAIClient {
             messages,
             temperature,
             tools,
+            stream: None,
         };
 
         let response = self
@@ -196,5 +355,45 @@ impl OpenAIClient {
         } else {
             Err("No completions returned from the model".into())
         }
+    }
+
+    pub async fn chat_completion_stream(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        tools: Option<Vec<OpenAITool>>,
+    ) -> Result<OpenAIStream, Box<dyn std::error::Error + Send + Sync>> {
+        let mut base = self.base_url.trim_end_matches('/').to_string();
+        if !base.ends_with("/v1") {
+            base = format!("{}/v1", base);
+        }
+        let url = format!("{}/chat/completions", base);
+        
+        let (_, model_name) = Self::parse_model_string(model);
+
+        let request = ChatCompletionRequest {
+            model: model_name,
+            messages,
+            temperature,
+            tools,
+            stream: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("API Request failed with status {}: {}", status, text).into());
+        }
+
+        Ok(OpenAIStream::new(response))
     }
 }
