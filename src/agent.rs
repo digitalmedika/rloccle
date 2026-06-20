@@ -1,5 +1,6 @@
 use crate::openai::{ChatMessage, OpenAIClient, OpenAITool, OpenAIFunction, ToolCall, FunctionCall, OpenAIStream};
 use crate::tool::Tool;
+use crate::memory::Memory;
 use std::env;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ pub struct Agent {
     config: AgentConfig,
     client: OpenAIClient,
     tools: HashMap<String, Arc<dyn Tool>>,
+    memory: Option<Memory>,
 }
 
 impl Agent {
@@ -70,7 +72,7 @@ impl Agent {
             });
 
         let client = OpenAIClient::new(base_url, api_key);
-        Ok(Self { config, client, tools })
+        Ok(Self { config, client, tools, memory: None })
     }
 
     pub fn builder() -> AgentBuilder {
@@ -94,15 +96,54 @@ impl Agent {
     }
 
     pub async fn generate(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let mut messages = Vec::new();
-        
-        // Add system instructions if present
-        if !self.config.instructions.is_empty() {
-            messages.push(ChatMessage::system(self.config.instructions.clone()));
-        }
+        self.generate_with_options(prompt, GenerateOptions::default()).await
+    }
 
-        // Add user prompt
-        messages.push(ChatMessage::user(prompt));
+    pub async fn generate_with_options(
+        &self,
+        prompt: &str,
+        options: GenerateOptions,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut messages = Vec::new();
+
+        let has_memory_and_thread = self.memory.is_some() && options.thread_id.is_some();
+        let user_prompt_index = if has_memory_and_thread {
+            let memory = self.memory.as_ref().unwrap();
+            let thread_id = options.thread_id.as_ref().unwrap();
+            
+            let history = memory.storage().get_messages(thread_id).await?;
+            
+            if !self.config.instructions.is_empty() {
+                messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+
+            if !history.is_empty() {
+                let start_idx = if let Some(limit) = memory.config().last_messages {
+                    if history.len() > limit {
+                        history.len() - limit
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                for msg in &history[start_idx..] {
+                    if msg.role == "system" {
+                        continue;
+                    }
+                    messages.push(msg.clone());
+                }
+            }
+            messages.push(ChatMessage::user(prompt));
+            messages.len() - 1
+        } else {
+            if !self.config.instructions.is_empty() {
+                messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+            messages.push(ChatMessage::user(prompt));
+            messages.len() - 1
+        };
 
         // Construct OpenAI tools specification
         let tools_spec: Option<Vec<OpenAITool>> = if self.tools.is_empty() {
@@ -126,7 +167,7 @@ impl Agent {
         let mut steps = 0;
         let max_steps = 5;
 
-        loop {
+        let final_content = loop {
             if steps >= max_steps {
                 return Err("Exceeded maximum tool execution steps".into());
             }
@@ -145,8 +186,7 @@ impl Agent {
             // If there are tool calls, we execute them
             if let Some(ref tool_calls) = response.tool_calls {
                 if tool_calls.is_empty() {
-                    // No tool calls, return text response if any
-                    return Ok(response.content.unwrap_or_default());
+                    break response.content.clone().unwrap_or_default();
                 }
 
                 // Add assistant's message (which contains the tool calls) to the history
@@ -160,7 +200,6 @@ impl Agent {
                     println!("Agent [{}] calling tool [{}] with arguments: {}", self.config.name, tool_name, tool_args_str);
 
                     let result_str = if let Some(tool) = self.tools.get(tool_name) {
-                        // Parse arguments as JSON Value
                         let args: serde_json::Value = serde_json::from_str(tool_args_str)
                             .unwrap_or(serde_json::Value::Null);
                         
@@ -186,19 +225,80 @@ impl Agent {
 
                 steps += 1;
             } else {
-                // If no tool calls, return text response
-                return Ok(response.content.unwrap_or_default());
+                break response.content.clone().unwrap_or_default();
             }
+        };
+
+        // Add the final assistant response to messages
+        messages.push(ChatMessage::assistant(Some(final_content.clone()), None));
+
+        // Save new messages to memory
+        if has_memory_and_thread {
+            let memory = self.memory.as_ref().unwrap();
+            let thread_id = options.thread_id.as_ref().unwrap();
+            
+            let mut full_history = memory.storage().get_messages(thread_id).await?;
+            if full_history.is_empty() {
+                memory.storage().create_thread(thread_id, options.resource_id.clone()).await?;
+            }
+
+            let new_messages = &messages[user_prompt_index..];
+            full_history.extend(new_messages.iter().cloned());
+            memory.storage().save_messages(thread_id, full_history).await?;
         }
+
+        Ok(final_content)
     }
 
     pub async fn stream(&self, prompt: &str) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.stream_with_options(prompt, GenerateOptions::default()).await
+    }
+
+    pub async fn stream_with_options(
+        &self,
+        prompt: &str,
+        options: GenerateOptions,
+    ) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
         let mut messages = Vec::new();
         
-        if !self.config.instructions.is_empty() {
-            messages.push(ChatMessage::system(self.config.instructions.clone()));
-        }
-        messages.push(ChatMessage::user(prompt));
+        let has_memory_and_thread = self.memory.is_some() && options.thread_id.is_some();
+        let user_prompt_index = if has_memory_and_thread {
+            let memory = self.memory.as_ref().unwrap();
+            let thread_id = options.thread_id.as_ref().unwrap();
+            
+            let history = memory.storage().get_messages(thread_id).await?;
+            
+            if !self.config.instructions.is_empty() {
+                messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+
+            if !history.is_empty() {
+                let start_idx = if let Some(limit) = memory.config().last_messages {
+                    if history.len() > limit {
+                        history.len() - limit
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                for msg in &history[start_idx..] {
+                    if msg.role == "system" {
+                        continue;
+                    }
+                    messages.push(msg.clone());
+                }
+            }
+            messages.push(ChatMessage::user(prompt));
+            messages.len() - 1
+        } else {
+            if !self.config.instructions.is_empty() {
+                messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+            messages.push(ChatMessage::user(prompt));
+            messages.len() - 1
+        };
 
         let tools_spec: Option<Vec<OpenAITool>> = if self.tools.is_empty() {
             None
@@ -229,6 +329,10 @@ impl Agent {
             steps: 0,
             max_steps: 5,
             state: StreamState::Init,
+            memory: self.memory.clone(),
+            thread_id: options.thread_id,
+            resource_id: options.resource_id,
+            user_prompt_index,
         })
     }
 }
@@ -243,6 +347,7 @@ pub struct AgentBuilder {
     api_key: Option<String>,
     temperature: Option<f32>,
     tools: Vec<Arc<dyn Tool>>,
+    memory: Option<Memory>,
 }
 
 impl AgentBuilder {
@@ -295,6 +400,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn memory(mut self, memory: Memory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, Box<dyn std::error::Error + Send + Sync>> {
         let _ = dotenvy::dotenv();
 
@@ -317,7 +427,31 @@ impl AgentBuilder {
         for t in self.tools {
             tools_map.insert(t.id().to_string(), t);
         }
-        Agent::new_with_tools(config, tools_map)
+        let mut agent = Agent::new_with_tools(config, tools_map)?;
+        agent.memory = self.memory;
+        Ok(agent)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GenerateOptions {
+    pub thread_id: Option<String>,
+    pub resource_id: Option<String>,
+}
+
+impl GenerateOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn thread_id(mut self, id: impl Into<String>) -> Self {
+        self.thread_id = Some(id.into());
+        self
+    }
+
+    pub fn resource_id(mut self, id: impl Into<String>) -> Self {
+        self.resource_id = Some(id.into());
+        self
     }
 }
 
@@ -383,6 +517,26 @@ pub struct AgentStream {
     steps: usize,
     max_steps: usize,
     state: StreamState,
+    memory: Option<Memory>,
+    thread_id: Option<String>,
+    resource_id: Option<String>,
+    user_prompt_index: usize,
+}
+
+impl AgentStream {
+    async fn save_memory_if_needed(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let (Some(memory), Some(thread_id)) = (&self.memory, &self.thread_id) {
+            let mut full_history = memory.storage().get_messages(thread_id).await?;
+            if full_history.is_empty() {
+                memory.storage().create_thread(thread_id, self.resource_id.clone()).await?;
+            }
+
+            let new_messages = &self.messages[self.user_prompt_index..];
+            full_history.extend(new_messages.iter().cloned());
+            memory.storage().save_messages(thread_id, full_history).await?;
+        }
+        Ok(())
+    }
 }
 
 impl AgentStream {
@@ -512,6 +666,9 @@ impl AgentStream {
                                 }
                             }
 
+                            if let Err(err) = self.save_memory_if_needed().await {
+                                println!("Failed to save memory: {}", err);
+                            }
                             self.state = StreamState::Finished;
                             return Some(Ok(AgentStreamEvent::Finish {
                                 finish_reason: Some("stop".to_string()),

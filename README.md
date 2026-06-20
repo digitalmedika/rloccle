@@ -152,6 +152,58 @@ cargo run --example streaming_agent
 
 ---
 
+## Conversation Memory
+
+`loccle-rs` includes a thread-based conversation memory system, allowing agents to retain context across turns by persisting message histories to a storage backend.
+
+### Storage Providers
+- **`InMemoryStorage`**: Stores conversation threads in-memory using a thread-safe `Mutex<HashMap>`. Ideal for testing or short-lived processes.
+- **`FileStorage`**: Persists conversation threads as JSON files locally under a specified directory. Ensures that memory survives application restarts.
+
+### Usage Example
+
+```rust
+use loccle::{agent, Memory, MemoryConfig, FileStorage, GenerateOptions};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    // 1. Initialize local file-based storage
+    let storage = Arc::new(FileStorage::new("./target/memory_dir"));
+    
+    // 2. Wrap it inside Memory with configuration options
+    let memory = Memory::new(storage, MemoryConfig {
+        last_messages: Some(10), // Limit history sent to the LLM to the last 10 messages
+    });
+
+    // 3. Register memory with the agent
+    let chat_agent = agent! {
+        id: "chat-agent",
+        name: "Memory Companion",
+        instructions: "You are a friendly chat companion.",
+        memory: memory,
+    };
+
+    // 4. Set thread options for the conversation
+    let options = GenerateOptions::new()
+        .thread_id("unique-session-123")
+        .resource_id("user-billy");
+
+    // First Turn
+    let res1 = chat_agent.generate_with_options("Hi, my name is Billy.", options.clone()).await.unwrap();
+    println!("Agent: {}", res1);
+
+    // Second Turn (Agent remembers the user's name from context)
+    let res2 = chat_agent.generate_with_options("What is my name?", options.clone()).await.unwrap();
+    println!("Agent: {}", res2);
+}
+```
+
+#### Why `generate_with_options`?
+In Rust, overloading method names or using optional arguments isn't supported natively. To prevent breaking existing stateless usages of `.generate(prompt)` and `.stream(prompt)`, `loccle-rs` provides `.generate_with_options(prompt, options)` and `.stream_with_options(prompt, options)`.
+
+---
+
 ## Built-in Tools
 
 Loccle comes with pre-packaged filesystem and system tools to make building agents easy.
@@ -253,6 +305,11 @@ copy .env.example .env
 cargo run --example simple_agent
 ```
 
+To run the new memory persistence demonstration:
+```bash
+cargo run --example memory_agent
+```
+
 ---
 
 ## Future Roadmap
@@ -261,5 +318,5 @@ This framework aims to build out full agentic capabilities in Rust:
 - [x] **Tools & Tool Calling**: Type-safe automatic schema generation (`schemars` + `serde`) and autonomous reasoning/execution loop.
 - [x] **Streaming Responses**: Real-time response deltas (text & reasoning) and step-by-step tool execution streams.
 - [ ] **Workflows**: Add step-based async DAG workflows with state transmission, retry mechanisms, and branching logic.
-- [ ] **Memory & Threads**: Implement short-term state storage and long-term conversation thread management.
+- [x] **Memory & Threads**: Implement short-term state storage and long-term conversation thread management.
 - [ ] **Vector DB Integrations**: Support native semantic search and RAG indexing.
