@@ -1,6 +1,6 @@
 use std::future::Future;
-use std::pin::Pin;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -11,7 +11,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> serde_json::Value;
     fn output_schema(&self) -> Option<serde_json::Value>;
-    fn execute(&self, args: serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, BoxError>>;
+    fn execute(
+        &self,
+        args: serde_json::Value,
+    ) -> BoxFuture<'static, Result<serde_json::Value, BoxError>>;
 }
 
 pub struct TypedTool<I, O, F> {
@@ -44,7 +47,10 @@ where
         Some(serde_json::to_value(schemars::schema_for!(O)).unwrap_or_default())
     }
 
-    fn execute(&self, args: serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, BoxError>> {
+    fn execute(
+        &self,
+        args: serde_json::Value,
+    ) -> BoxFuture<'static, Result<serde_json::Value, BoxError>> {
         let exec = self.execute_fn.clone();
         Box::pin(async move {
             let input: I = serde_json::from_value(args)?;

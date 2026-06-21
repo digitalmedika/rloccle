@@ -1,10 +1,12 @@
-use crate::openai::{ChatMessage, OpenAIClient, OpenAITool, OpenAIFunction, ToolCall, FunctionCall, OpenAIStream};
-use crate::tool::Tool;
 use crate::memory::Memory;
-use std::env;
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::openai::{
+    ChatMessage, FunctionCall, OpenAIClient, OpenAIFunction, OpenAIStream, OpenAITool, ToolCall,
+};
+use crate::tool::Tool;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::sync::Arc;
 
 macro_rules! agent_println {
     ($($arg:tt)*) => {
@@ -71,7 +73,9 @@ impl Agent {
             .ok_or("API key is required. Set OPENAI_API_KEY env var or provide it in the configuration.")?;
 
         let (provider, _) = OpenAIClient::parse_model_string(&config.model);
-        let base_url = config.base_url.clone()
+        let base_url = config
+            .base_url
+            .clone()
             .or_else(|| env::var("OPENAI_API_BASE").ok())
             .or_else(|| env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| {
@@ -83,7 +87,13 @@ impl Agent {
             });
 
         let client = OpenAIClient::new(base_url, api_key);
-        Ok(Self { config, client, tools, memory: None, task_signal_provider: false })
+        Ok(Self {
+            config,
+            client,
+            tools,
+            memory: None,
+            task_signal_provider: false,
+        })
     }
 
     pub fn builder() -> AgentBuilder {
@@ -114,8 +124,12 @@ impl Agent {
         self.memory.as_ref()
     }
 
-    pub async fn generate(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.generate_with_options(prompt, GenerateOptions::default()).await
+    pub async fn generate(
+        &self,
+        prompt: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.generate_with_options(prompt, GenerateOptions::default())
+            .await
     }
 
     pub async fn generate_with_options(
@@ -129,9 +143,9 @@ impl Agent {
         let user_prompt_index = if has_memory_and_thread {
             let memory = self.memory.as_ref().unwrap();
             let thread_id = options.thread_id.as_ref().unwrap();
-            
+
             let history = memory.storage().get_messages(thread_id).await?;
-            
+
             if !self.config.instructions.is_empty() {
                 messages.push(ChatMessage::system(self.config.instructions.clone()));
             }
@@ -139,7 +153,9 @@ impl Agent {
             if self.task_signal_provider {
                 if let Ok(Some(session)) = memory.storage().get_thread(thread_id).await {
                     if let Some(tasks_val) = session.state.get("tasks") {
-                        if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(tasks_val.clone()) {
+                        if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(
+                            tasks_val.clone(),
+                        ) {
                             if !tasks.is_empty() {
                                 let mut tasks_xml = String::from("<tasks>\n");
                                 for task in &tasks {
@@ -234,31 +250,43 @@ impl Agent {
                 for tool_call in tool_calls {
                     let tool_name = &tool_call.function.name;
                     let tool_args_str = &tool_call.function.arguments;
-                    
-                    agent_println!("Agent [{}] calling tool [{}] with arguments: {}", self.config.name, tool_name, tool_args_str);
+
+                    agent_println!(
+                        "Agent [{}] calling tool [{}] with arguments: {}",
+                        self.config.name,
+                        tool_name,
+                        tool_args_str
+                    );
 
                     let result_str = if let Some(tool) = self.tools.get(tool_name) {
-                        let args: serde_json::Value = serde_json::from_str(tool_args_str)
-                            .unwrap_or(serde_json::Value::Null);
-                        
+                        let args: serde_json::Value =
+                            serde_json::from_str(tool_args_str).unwrap_or(serde_json::Value::Null);
+
                         let context = crate::tools::task::ExecutionContext {
                             thread_id: options.thread_id.clone(),
                             resource_id: options.resource_id.clone(),
                             memory: self.memory.clone(),
                         };
                         let tool_name_for_scope = tool_name.clone();
-                        crate::tools::task::CURRENT_CONTEXT.scope(context, async move {
-                            match tool.execute(args).await {
-                                Ok(res) => res.to_string(),
-                                Err(e) => {
-                                    agent_println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
-                                    serde_json::json!({ "error": e.to_string() }).to_string()
+                        crate::tools::task::CURRENT_CONTEXT
+                            .scope(context, async move {
+                                match tool.execute(args).await {
+                                    Ok(res) => res.to_string(),
+                                    Err(e) => {
+                                        agent_println!(
+                                            "Error executing tool [{}]: {}",
+                                            tool_name_for_scope,
+                                            e
+                                        );
+                                        serde_json::json!({ "error": e.to_string() }).to_string()
+                                    }
                                 }
-                            }
-                        }).await
+                            })
+                            .await
                     } else {
                         agent_println!("Tool [{}] not found", tool_name);
-                        serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
+                        serde_json::json!({ "error": format!("Tool {} not found", tool_name) })
+                            .to_string()
                     };
 
                     // Add tool response to history
@@ -282,23 +310,33 @@ impl Agent {
         if has_memory_and_thread {
             let memory = self.memory.as_ref().unwrap();
             let thread_id = options.thread_id.as_ref().unwrap();
-            
+
             let thread_exists = memory.storage().get_thread(thread_id).await?.is_some();
             if !thread_exists {
-                memory.storage().create_thread(thread_id, options.resource_id.clone()).await?;
+                memory
+                    .storage()
+                    .create_thread(thread_id, options.resource_id.clone())
+                    .await?;
             }
             let mut full_history = memory.storage().get_messages(thread_id).await?;
 
             let new_messages = &messages[user_prompt_index..];
             full_history.extend(new_messages.iter().cloned());
-            memory.storage().save_messages(thread_id, full_history).await?;
+            memory
+                .storage()
+                .save_messages(thread_id, full_history)
+                .await?;
         }
 
         Ok(final_content)
     }
 
-    pub async fn stream(&self, prompt: &str) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
-        self.stream_with_options(prompt, GenerateOptions::default()).await
+    pub async fn stream(
+        &self,
+        prompt: &str,
+    ) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.stream_with_options(prompt, GenerateOptions::default())
+            .await
     }
 
     pub async fn stream_with_options(
@@ -307,40 +345,42 @@ impl Agent {
         options: GenerateOptions,
     ) -> Result<AgentStream, Box<dyn std::error::Error + Send + Sync>> {
         let mut messages = Vec::new();
-        
-        let has_memory_and_thread = self.memory.is_some() && options.thread_id.is_some();
-            let user_prompt_index = if has_memory_and_thread {
-                let memory = self.memory.as_ref().unwrap();
-                let thread_id = options.thread_id.as_ref().unwrap();
-                
-                let history = memory.storage().get_messages(thread_id).await?;
-                
-                if !self.config.instructions.is_empty() {
-                    messages.push(ChatMessage::system(self.config.instructions.clone()));
-                }
 
-                if self.task_signal_provider {
-                    if let Ok(Some(session)) = memory.storage().get_thread(thread_id).await {
-                        if let Some(tasks_val) = session.state.get("tasks") {
-                            if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(tasks_val.clone()) {
-                                if !tasks.is_empty() {
-                                    let mut tasks_xml = String::from("<tasks>\n");
-                                    for task in &tasks {
-                                        tasks_xml.push_str(&format!(
+        let has_memory_and_thread = self.memory.is_some() && options.thread_id.is_some();
+        let user_prompt_index = if has_memory_and_thread {
+            let memory = self.memory.as_ref().unwrap();
+            let thread_id = options.thread_id.as_ref().unwrap();
+
+            let history = memory.storage().get_messages(thread_id).await?;
+
+            if !self.config.instructions.is_empty() {
+                messages.push(ChatMessage::system(self.config.instructions.clone()));
+            }
+
+            if self.task_signal_provider {
+                if let Ok(Some(session)) = memory.storage().get_thread(thread_id).await {
+                    if let Some(tasks_val) = session.state.get("tasks") {
+                        if let Ok(tasks) = serde_json::from_value::<Vec<crate::tools::task::Task>>(
+                            tasks_val.clone(),
+                        ) {
+                            if !tasks.is_empty() {
+                                let mut tasks_xml = String::from("<tasks>\n");
+                                for task in &tasks {
+                                    tasks_xml.push_str(&format!(
                                             "  <task id=\"{}\" status=\"{}\" activeForm=\"{}\">{}</task>\n",
                                             task.id, task.status, task.active_form, task.content
                                         ));
-                                    }
-                                    tasks_xml.push_str("</tasks>");
-                                    messages.push(ChatMessage::system(format!(
+                                }
+                                tasks_xml.push_str("</tasks>");
+                                messages.push(ChatMessage::system(format!(
                                         "Here is the list of tasks currently tracked for this thread:\n{}",
                                         tasks_xml
                                     )));
-                                }
                             }
                         }
                     }
                 }
+            }
 
             if !history.is_empty() {
                 let start_idx = if let Some(limit) = memory.config().last_messages {
@@ -493,7 +533,8 @@ impl AgentBuilder {
     pub fn build(self) -> Result<Agent, Box<dyn std::error::Error + Send + Sync>> {
         let _ = dotenvy::dotenv();
 
-        let model = self.model
+        let model = self
+            .model
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or_else(|| env::var("AGENT_MODEL").ok())
             .unwrap_or_else(|| "openai/gpt-4o".to_string());
@@ -625,20 +666,28 @@ impl AgentStream {
         if let (Some(memory), Some(thread_id)) = (&self.memory, &self.thread_id) {
             let thread_exists = memory.storage().get_thread(thread_id).await?.is_some();
             if !thread_exists {
-                memory.storage().create_thread(thread_id, self.resource_id.clone()).await?;
+                memory
+                    .storage()
+                    .create_thread(thread_id, self.resource_id.clone())
+                    .await?;
             }
             let mut full_history = memory.storage().get_messages(thread_id).await?;
 
             let new_messages = &self.messages[self.user_prompt_index..];
             full_history.extend(new_messages.iter().cloned());
-            memory.storage().save_messages(thread_id, full_history).await?;
+            memory
+                .storage()
+                .save_messages(thread_id, full_history)
+                .await?;
         }
         Ok(())
     }
 }
 
 impl AgentStream {
-    pub async fn next(&mut self) -> Option<Result<AgentStreamEvent, Box<dyn std::error::Error + Send + Sync>>> {
+    pub async fn next(
+        &mut self,
+    ) -> Option<Result<AgentStreamEvent, Box<dyn std::error::Error + Send + Sync>>> {
         loop {
             match &mut self.state {
                 StreamState::Init => {
@@ -647,12 +696,15 @@ impl AgentStream {
                         return Some(Err("Exceeded maximum tool execution steps".into()));
                     }
 
-                    let stream_res = self.client.chat_completion_stream(
-                        &self.model,
-                        self.messages.clone(),
-                        self.temperature,
-                        self.tools_spec.clone(),
-                    ).await;
+                    let stream_res = self
+                        .client
+                        .chat_completion_stream(
+                            &self.model,
+                            self.messages.clone(),
+                            self.temperature,
+                            self.tools_spec.clone(),
+                        )
+                        .await;
 
                     match stream_res {
                         Ok(openai_stream) => {
@@ -674,110 +726,129 @@ impl AgentStream {
                     accumulated_content,
                     accumulated_reasoning,
                     accumulated_tool_calls,
-                } => {
-                    match stream.next().await {
-                        Some(Ok(chunk)) => {
-                            let mut text_delta = None;
-                            let mut reasoning_delta = None;
+                } => match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let mut text_delta = None;
+                        let mut reasoning_delta = None;
 
-                            for choice in &chunk.choices {
-                                if let Some(ref content) = choice.delta.content {
-                                    accumulated_content.push_str(content);
-                                    text_delta = Some(content.clone());
-                                }
-                                if let Some(ref reasoning) = choice.delta.reasoning_content {
-                                    accumulated_reasoning.push_str(reasoning);
-                                    reasoning_delta = Some(reasoning.clone());
-                                }
-                                if let Some(ref tool_calls) = choice.delta.tool_calls {
-                                    for delta in tool_calls {
-                                        let idx = delta.index as usize;
-                                        while accumulated_tool_calls.len() <= idx {
-                                            accumulated_tool_calls.push(AccumulatedToolCall {
-                                                id: String::new(),
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            });
+                        for choice in &chunk.choices {
+                            if let Some(ref content) = choice.delta.content {
+                                accumulated_content.push_str(content);
+                                text_delta = Some(content.clone());
+                            }
+                            if let Some(ref reasoning) = choice.delta.reasoning_content {
+                                accumulated_reasoning.push_str(reasoning);
+                                reasoning_delta = Some(reasoning.clone());
+                            }
+                            if let Some(ref tool_calls) = choice.delta.tool_calls {
+                                for delta in tool_calls {
+                                    let idx = delta.index as usize;
+                                    while accumulated_tool_calls.len() <= idx {
+                                        accumulated_tool_calls.push(AccumulatedToolCall {
+                                            id: String::new(),
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        });
+                                    }
+                                    if let Some(id) = &delta.id {
+                                        accumulated_tool_calls[idx].id = id.clone();
+                                    }
+                                    if let Some(func) = &delta.function {
+                                        if let Some(name) = &func.name {
+                                            accumulated_tool_calls[idx].name = name.clone();
                                         }
-                                        if let Some(id) = &delta.id {
-                                            accumulated_tool_calls[idx].id = id.clone();
-                                        }
-                                        if let Some(func) = &delta.function {
-                                            if let Some(name) = &func.name {
-                                                accumulated_tool_calls[idx].name = name.clone();
-                                            }
-                                            if let Some(args) = &func.arguments {
-                                                accumulated_tool_calls[idx].arguments.push_str(args);
-                                            }
+                                        if let Some(args) = &func.arguments {
+                                            accumulated_tool_calls[idx].arguments.push_str(args);
                                         }
                                     }
                                 }
                             }
+                        }
 
-                            if let Some(text) = text_delta {
-                                return Some(Ok(AgentStreamEvent::TextDelta(text)));
-                            }
-                            if let Some(reasoning) = reasoning_delta {
-                                return Some(Ok(AgentStreamEvent::ReasoningDelta(reasoning)));
-                            }
+                        if let Some(text) = text_delta {
+                            return Some(Ok(AgentStreamEvent::TextDelta(text)));
                         }
-                        Some(Err(e)) => {
-                            self.state = StreamState::Finished;
-                            return Some(Err(e));
+                        if let Some(reasoning) = reasoning_delta {
+                            return Some(Ok(AgentStreamEvent::ReasoningDelta(reasoning)));
                         }
-                        None => {
-                            let (content, _reasoning, tool_calls) = match std::mem::replace(&mut self.state, StreamState::Init) {
+                    }
+                    Some(Err(e)) => {
+                        self.state = StreamState::Finished;
+                        return Some(Err(e));
+                    }
+                    None => {
+                        let (content, _reasoning, tool_calls) =
+                            match std::mem::replace(&mut self.state, StreamState::Init) {
                                 StreamState::StreamingLLM {
                                     accumulated_content,
                                     accumulated_reasoning,
                                     accumulated_tool_calls,
                                     ..
-                                } => (accumulated_content, accumulated_reasoning, accumulated_tool_calls),
+                                } => (
+                                    accumulated_content,
+                                    accumulated_reasoning,
+                                    accumulated_tool_calls,
+                                ),
                                 _ => unreachable!(),
                             };
 
-                            let assistant_content = if content.is_empty() { None } else { Some(content) };
-                            
-                            let open_tool_calls = if tool_calls.is_empty() {
-                                None
-                            } else {
-                                Some(tool_calls.iter().map(|tc| ToolCall {
-                                    id: tc.id.clone(),
-                                    r#type: "function".to_string(),
-                                    function: FunctionCall {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
-                                }).collect::<Vec<_>>())
-                            };
+                        let assistant_content = if content.is_empty() {
+                            None
+                        } else {
+                            Some(content)
+                        };
 
-                            self.messages.push(ChatMessage::assistant(assistant_content, open_tool_calls.clone()));
+                        let open_tool_calls = if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                tool_calls
+                                    .iter()
+                                    .map(|tc| ToolCall {
+                                        id: tc.id.clone(),
+                                        r#type: "function".to_string(),
+                                        function: FunctionCall {
+                                            name: tc.name.clone(),
+                                            arguments: tc.arguments.clone(),
+                                        },
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        };
 
-                            if let Some(calls) = open_tool_calls {
-                                if !calls.is_empty() {
-                                    self.state = StreamState::ExecutingTools {
-                                        tool_calls: calls,
-                                        index: 0,
-                                        yielded_call: false,
-                                    };
-                                    continue;
-                                }
+                        self.messages.push(ChatMessage::assistant(
+                            assistant_content,
+                            open_tool_calls.clone(),
+                        ));
+
+                        if let Some(calls) = open_tool_calls {
+                            if !calls.is_empty() {
+                                self.state = StreamState::ExecutingTools {
+                                    tool_calls: calls,
+                                    index: 0,
+                                    yielded_call: false,
+                                };
+                                continue;
                             }
-
-                            if let Err(err) = self.save_memory_if_needed().await {
-                                agent_println!("Failed to save memory: {}", err);
-                            }
-                            self.state = StreamState::Finished;
-                            return Some(Ok(AgentStreamEvent::Finish {
-                                finish_reason: Some("stop".to_string()),
-                                prompt_tokens: None,
-                                completion_tokens: None,
-                                total_tokens: None,
-                            }));
                         }
+
+                        if let Err(err) = self.save_memory_if_needed().await {
+                            agent_println!("Failed to save memory: {}", err);
+                        }
+                        self.state = StreamState::Finished;
+                        return Some(Ok(AgentStreamEvent::Finish {
+                            finish_reason: Some("stop".to_string()),
+                            prompt_tokens: None,
+                            completion_tokens: None,
+                            total_tokens: None,
+                        }));
                     }
-                }
-                StreamState::ExecutingTools { tool_calls, index, yielded_call } => {
+                },
+                StreamState::ExecutingTools {
+                    tool_calls,
+                    index,
+                    yielded_call,
+                } => {
                     let idx = *index;
                     if idx >= tool_calls.len() {
                         self.steps += 1;
@@ -798,30 +869,43 @@ impl AgentStream {
                         let tool_args_str = tool_call.function.arguments.clone();
                         let tool_id = tool_call.id.clone();
 
-                        agent_println!("Agent [{}] calling tool [{}] with arguments: {}", self.agent_name, tool_name, tool_args_str);
+                        agent_println!(
+                            "Agent [{}] calling tool [{}] with arguments: {}",
+                            self.agent_name,
+                            tool_name,
+                            tool_args_str
+                        );
 
                         let result_str = if let Some(tool) = self.tools.get(&tool_name) {
                             let args: serde_json::Value = serde_json::from_str(&tool_args_str)
                                 .unwrap_or(serde_json::Value::Null);
-                            
+
                             let context = crate::tools::task::ExecutionContext {
                                 thread_id: self.thread_id.clone(),
                                 resource_id: self.resource_id.clone(),
                                 memory: self.memory.clone(),
                             };
                             let tool_name_for_scope = tool_name.clone();
-                            crate::tools::task::CURRENT_CONTEXT.scope(context, async move {
-                                match tool.execute(args).await {
-                                    Ok(res) => res.to_string(),
-                                    Err(e) => {
-                                        agent_println!("Error executing tool [{}]: {}", tool_name_for_scope, e);
-                                        serde_json::json!({ "error": e.to_string() }).to_string()
+                            crate::tools::task::CURRENT_CONTEXT
+                                .scope(context, async move {
+                                    match tool.execute(args).await {
+                                        Ok(res) => res.to_string(),
+                                        Err(e) => {
+                                            agent_println!(
+                                                "Error executing tool [{}]: {}",
+                                                tool_name_for_scope,
+                                                e
+                                            );
+                                            serde_json::json!({ "error": e.to_string() })
+                                                .to_string()
+                                        }
                                     }
-                                }
-                            }).await
+                                })
+                                .await
                         } else {
                             agent_println!("Tool [{}] not found", tool_name);
-                            serde_json::json!({ "error": format!("Tool {} not found", tool_name) }).to_string()
+                            serde_json::json!({ "error": format!("Tool {} not found", tool_name) })
+                                .to_string()
                         };
 
                         self.messages.push(ChatMessage::tool(
@@ -852,14 +936,14 @@ fn get_safe_history_start_index(history: &[ChatMessage], limit: usize) -> usize 
     if history.len() <= limit {
         return 0;
     }
-    
+
     let mut start_idx = history.len() - limit;
-    
+
     // Scan backwards to ensure we don't start with a 'tool' role message.
     // A 'tool' message must always be preceded by the corresponding 'assistant' message that declared the tool call.
     while start_idx > 0 && history[start_idx].role == "tool" {
         start_idx -= 1;
     }
-    
+
     start_idx
 }

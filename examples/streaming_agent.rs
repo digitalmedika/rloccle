@@ -1,6 +1,6 @@
-use loccle::{agent, create_tool, Tool, AgentStreamEvent};
-use serde::{Deserialize, Serialize};
+use loccle::{AgentStreamEvent, Tool, agent, create_tool};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
@@ -35,8 +35,10 @@ async fn main() {
         "Fetches weather for a location",
         |args| async move {
             let weather_info = format!("Weather in {} is sunny and 72°F", args.location);
-            Ok(WeatherOutput { weather: weather_info })
-        }
+            Ok(WeatherOutput {
+                weather: weather_info,
+            })
+        },
     );
 
     // Define an Agent and register our weather_tool
@@ -65,16 +67,26 @@ async fn main() {
                             print!("[Reasoning: {}]", reasoning);
                             let _ = std::io::stdout().flush();
                         }
-                        AgentStreamEvent::ToolCall { id, name, arguments } => {
-                            println!("\n[Stream Event] Tool Call: {} (ID: {}) with args: {}", name, id, arguments);
+                        AgentStreamEvent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            println!(
+                                "\n[Stream Event] Tool Call: {} (ID: {}) with args: {}",
+                                name, id, arguments
+                            );
                         }
                         AgentStreamEvent::ToolResult { id, name, result } => {
-                            println!("[Stream Event] Tool Result from {} (ID: {}): {}", name, id, result);
+                            println!(
+                                "[Stream Event] Tool Result from {} (ID: {}): {}",
+                                name, id, result
+                            );
                         }
                         AgentStreamEvent::Finish { finish_reason, .. } => {
                             println!("\n[Stream Event] Finish: {:?}", finish_reason);
                         }
-                    }
+                    },
                     Err(e) => {
                         println!("\nError in stream: {}", e);
                     }

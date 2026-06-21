@@ -56,7 +56,10 @@ async fn main() {
     // 4. Let's make an execution attempt with Agent 3 (Env-Configured)
     println!("\n=== Prompting Agent 3 (Env-Configured) ===");
 
-    match env_agent.generate("Hello, explain Rust in one short sentence.").await {
+    match env_agent
+        .generate("Hello, explain Rust in one short sentence.")
+        .await
+    {
         Ok(response) => {
             println!("\n[LLM Response]:\n{}", response);
         }

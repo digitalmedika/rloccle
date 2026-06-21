@@ -28,6 +28,7 @@ const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
 const TOOL_PROGRESS_WIDTH: usize = 28;
 const TOOL_PROGRESS_TICK_MS: u64 = 120;
+const READ_PREVIEW_MAX_LINES: usize = 120;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -45,6 +46,8 @@ struct LogEntry {
     kind: LogKind,
     text: String,
     is_running: bool,
+    read_preview: Option<ReadPreview>,
+    grep_preview: Option<GrepPreview>,
 }
 
 impl LogEntry {
@@ -53,6 +56,8 @@ impl LogEntry {
             kind,
             text,
             is_running: false,
+            read_preview: None,
+            grep_preview: None,
         }
     }
 
@@ -61,7 +66,157 @@ impl LogEntry {
             kind: LogKind::ToolCall,
             text,
             is_running: true,
+            read_preview: None,
+            grep_preview: None,
         }
+    }
+
+    fn new_read_preview(preview: ReadPreview) -> Self {
+        Self {
+            kind: LogKind::ToolResult,
+            text: preview.to_plain_text(),
+            is_running: false,
+            read_preview: Some(preview),
+            grep_preview: None,
+        }
+    }
+
+    fn new_grep_preview(preview: GrepPreview) -> Self {
+        Self {
+            kind: LogKind::ToolResult,
+            text: preview.to_plain_text(),
+            is_running: false,
+            read_preview: None,
+            grep_preview: Some(preview),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReadPreview {
+    path: String,
+    content: String,
+    start_line: usize,
+    returned_lines: usize,
+    total_lines: Option<usize>,
+    is_range: bool,
+}
+
+impl ReadPreview {
+    fn display_path(&self) -> String {
+        self.path.replace('\\', "/")
+    }
+
+    fn offset(&self) -> usize {
+        self.start_line.saturating_sub(1)
+    }
+
+    fn limit(&self) -> usize {
+        self.returned_lines
+    }
+
+    fn title_metadata(&self) -> String {
+        if self.is_range {
+            format!("limit={}, offset={}", self.limit(), self.offset())
+        } else {
+            format!("lines={}", self.returned_lines)
+        }
+    }
+
+    fn hidden_line_count(&self) -> usize {
+        let display_count = self.content.lines().take(READ_PREVIEW_MAX_LINES).count();
+        let returned_hidden = self.returned_lines.saturating_sub(display_count);
+        let returned_end = self.start_line + self.returned_lines.saturating_sub(1);
+        let hidden_after_returned = if self.is_range {
+            self.total_lines
+                .unwrap_or(returned_end)
+                .saturating_sub(returned_end)
+        } else {
+            0
+        };
+        returned_hidden + hidden_after_returned
+    }
+
+    fn to_plain_text(&self) -> String {
+        let mut lines = vec![format!(
+            "View {} ({})",
+            self.display_path(),
+            self.title_metadata()
+        )];
+        let line_number_width = (self.start_line + self.returned_lines).to_string().len().max(3);
+
+        for (idx, content_line) in self.content.lines().take(READ_PREVIEW_MAX_LINES).enumerate() {
+            lines.push(format!(
+                "{:>width$}    {}",
+                self.start_line + idx,
+                content_line,
+                width = line_number_width
+            ));
+        }
+
+        let hidden = self.hidden_line_count();
+        if hidden > 0 {
+            lines.push(format!("... ({} lines hidden)", hidden));
+        }
+
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GrepPreview {
+    query: String,
+    path: String,
+    matches: Vec<GrepPreviewMatch>,
+    hidden_matches: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GrepPreviewMatch {
+    file: String,
+    line: usize,
+    content: String,
+    char_index: Option<usize>,
+}
+
+impl GrepPreview {
+    fn display_path(&self) -> String {
+        self.path.replace('\\', "/")
+    }
+
+    fn to_plain_text(&self) -> String {
+        let shown = self.matches.len();
+        let total = shown + self.hidden_matches;
+        let mut lines = vec![format!("Grep {} (path={})", self.query, self.display_path())];
+
+        if total == 0 {
+            lines.push("No matches found".to_string());
+            return lines.join("\n");
+        }
+
+        lines.push(format!(
+            "Found {} match{}",
+            total,
+            if total == 1 { "" } else { "es" }
+        ));
+
+        for item in &self.matches {
+            lines.push(format!("{}:", item.file.replace('\\', "/")));
+            let char_text = item
+                .char_index
+                .map(|idx| format!(", Char {}", idx))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  Line {}{}:    {}",
+                item.line, char_text, item.content
+            ));
+        }
+
+        if self.hidden_matches > 0 {
+            lines.push(format!("... ({} matches hidden)", self.hidden_matches));
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -354,6 +509,466 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
         )
         .style(Style::default().fg(Color::White));
     f.render_widget(list, area);
+}
+
+fn push_read_preview_lines(lines: &mut Vec<Line<'static>>, preview: &ReadPreview) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            "✓ ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "View",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(preview.display_path(), Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(
+            format!("({})", preview.title_metadata()),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+
+    let line_number_width = (preview.start_line + preview.returned_lines)
+        .to_string()
+        .len()
+        .max(3);
+
+    for (idx, code_line) in preview
+        .content
+        .lines()
+        .take(READ_PREVIEW_MAX_LINES)
+        .enumerate()
+    {
+        let mut spans = vec![Span::styled(
+            format!("{:>width$}    ", preview.start_line + idx, width = line_number_width),
+            Style::default().fg(Color::DarkGray),
+        )];
+        spans.extend(highlight_code_line(&preview.path, code_line));
+        lines.push(Line::from(spans));
+    }
+
+    let hidden = preview.hidden_line_count();
+    if hidden > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "... ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("({} lines hidden)", hidden),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+}
+
+fn push_grep_preview_lines(
+    lines: &mut Vec<Line<'static>>,
+    preview: &GrepPreview,
+    content_width: usize,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            "│ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "✓ ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Grep",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(preview.query.clone(), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(
+            format!("(path={})", preview.display_path()),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+
+    let panel_width = content_width.saturating_sub(4).max(20);
+    let total = preview.matches.len() + preview.hidden_matches;
+    let panel_style = Style::default()
+        .fg(Color::Gray)
+        .bg(Color::Rgb(43, 42, 54));
+
+    if total == 0 {
+        push_grep_panel_plain_line(lines, panel_width, "No matches found", panel_style);
+        return;
+    }
+
+    push_grep_panel_plain_line(
+        lines,
+        panel_width,
+        &format!(
+            "Found {} match{}",
+            total,
+            if total == 1 { "" } else { "es" }
+        ),
+        panel_style,
+    );
+
+    for item in &preview.matches {
+        push_grep_panel_plain_line(
+            lines,
+            panel_width,
+            &format!("{}:", item.file.replace('\\', "/")),
+            panel_style,
+        );
+
+        let char_text = item
+            .char_index
+            .map(|idx| format!(", Char {}", idx))
+            .unwrap_or_default();
+        let prefix = format!("  Line {}{}:    ", item.line, char_text);
+        push_grep_match_line(lines, panel_width, &prefix, &item.content, &preview.query);
+    }
+
+    if preview.hidden_matches > 0 {
+        push_grep_panel_plain_line(
+            lines,
+            panel_width,
+            &format!("... ({} matches hidden)", preview.hidden_matches),
+            panel_style,
+        );
+    }
+}
+
+fn push_grep_panel_plain_line(
+    lines: &mut Vec<Line<'static>>,
+    panel_width: usize,
+    text: &str,
+    style: Style,
+) {
+    let padded = pad_to_width(&format!(" {}", text), panel_width);
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default()),
+        Span::styled(padded, style),
+    ]));
+}
+
+fn push_grep_match_line(
+    lines: &mut Vec<Line<'static>>,
+    panel_width: usize,
+    prefix: &str,
+    content: &str,
+    query: &str,
+) {
+    let panel_style = Style::default()
+        .fg(Color::Gray)
+        .bg(Color::Rgb(43, 42, 54));
+    let prefix_style = Style::default()
+        .fg(Color::LightBlue)
+        .bg(Color::Rgb(43, 42, 54));
+    let match_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans = vec![
+        Span::styled("│ ", Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default()),
+        Span::styled(prefix.to_string(), prefix_style),
+    ];
+    let mut used_width = display_width(prefix);
+
+    for span in highlight_query_spans(content, query, panel_style, match_style) {
+        used_width += display_width(span.content.as_ref());
+        spans.push(span);
+    }
+
+    if used_width < panel_width {
+        spans.push(Span::styled(" ".repeat(panel_width - used_width), panel_style));
+    }
+
+    lines.push(Line::from(spans));
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let text_width = display_width(text);
+    if text_width >= width {
+        return text.to_string();
+    }
+
+    format!("{}{}", text, " ".repeat(width - text_width))
+}
+
+fn highlight_query_spans(
+    content: &str,
+    query: &str,
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    let Some((start, end)) = find_case_insensitive_range(content, query) else {
+        return vec![Span::styled(content.to_string(), normal_style)];
+    };
+
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled(content[..start].to_string(), normal_style));
+    }
+    spans.push(Span::styled(content[start..end].to_string(), match_style));
+    if end < content.len() {
+        spans.push(Span::styled(content[end..].to_string(), normal_style));
+    }
+    spans
+}
+
+fn find_case_insensitive_range(content: &str, query: &str) -> Option<(usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let content_lower = content.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let start = content_lower.find(&query_lower)?;
+    let end = start + query_lower.len();
+    if content.is_char_boundary(start) && content.is_char_boundary(end) {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn highlight_code_line(path: &str, line: &str) -> Vec<Span<'static>> {
+    if Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        return highlight_rust_line(line);
+    }
+
+    vec![Span::styled(
+        line.to_string(),
+        Style::default().fg(Color::White),
+    )]
+}
+
+fn highlight_rust_line(line: &str) -> Vec<Span<'static>> {
+    let keyword_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let type_style = Style::default().fg(Color::LightYellow);
+    let string_style = Style::default().fg(Color::LightGreen);
+    let number_style = Style::default().fg(Color::LightMagenta);
+    let comment_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let attr_style = Style::default().fg(Color::Red);
+    let macro_style = Style::default().fg(Color::Magenta);
+    let normal_style = Style::default().fg(Color::White);
+    let punctuation_style = Style::default().fg(Color::Gray);
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans = Vec::new();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let rest: String = chars[idx..].iter().collect();
+
+        if rest.starts_with("//") {
+            spans.push(Span::styled(rest, comment_style));
+            break;
+        }
+
+        if rest.starts_with("#[") {
+            let start = idx;
+            idx += 2;
+            while idx < chars.len() && chars[idx] != ']' {
+                idx += 1;
+            }
+            if idx < chars.len() {
+                idx += 1;
+            }
+            spans.push(Span::styled(
+                chars[start..idx].iter().collect::<String>(),
+                attr_style,
+            ));
+            continue;
+        }
+
+        let ch = chars[idx];
+        if ch == '"' {
+            let start = idx;
+            idx += 1;
+            let mut escaped = false;
+            while idx < chars.len() {
+                let current = chars[idx];
+                idx += 1;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if current == '\\' {
+                    escaped = true;
+                } else if current == '"' {
+                    break;
+                }
+            }
+            spans.push(Span::styled(
+                chars[start..idx].iter().collect::<String>(),
+                string_style,
+            ));
+            continue;
+        }
+
+        if ch == '\'' && idx + 1 < chars.len() && !chars[idx + 1].is_ascii_alphabetic() {
+            let start = idx;
+            idx += 1;
+            let mut escaped = false;
+            while idx < chars.len() {
+                let current = chars[idx];
+                idx += 1;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if current == '\\' {
+                    escaped = true;
+                } else if current == '\'' {
+                    break;
+                }
+            }
+            spans.push(Span::styled(
+                chars[start..idx].iter().collect::<String>(),
+                string_style,
+            ));
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len()
+                && (chars[idx].is_ascii_alphanumeric()
+                    || matches!(chars[idx], '_' | '.' | ':'))
+            {
+                idx += 1;
+            }
+            spans.push(Span::styled(
+                chars[start..idx].iter().collect::<String>(),
+                number_style,
+            ));
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && (chars[idx].is_ascii_alphanumeric() || chars[idx] == '_') {
+                idx += 1;
+            }
+            let mut ident: String = chars[start..idx].iter().collect();
+            let style = if idx < chars.len() && chars[idx] == '!' {
+                idx += 1;
+                ident.push('!');
+                macro_style
+            } else if is_rust_keyword(&ident) {
+                keyword_style
+            } else if is_rust_type(&ident) || ident.chars().next().is_some_and(|c| c.is_uppercase()) {
+                type_style
+            } else {
+                normal_style
+            };
+            spans.push(Span::styled(ident, style));
+            continue;
+        }
+
+        let style = if ch.is_whitespace() {
+            normal_style
+        } else {
+            punctuation_style
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+        idx += 1;
+    }
+
+    spans
+}
+
+fn is_rust_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+    )
+}
+
+fn is_rust_type(word: &str) -> bool {
+    matches!(
+        word,
+        "bool"
+            | "char"
+            | "f32"
+            | "f64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "str"
+            | "String"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "Box"
+            | "Option"
+            | "Result"
+            | "Vec"
+    )
 }
 
 fn animated_progress_line(tool: &ActiveToolProgress) -> String {
@@ -758,6 +1373,17 @@ async fn run_app(
                         }
                     }
                     LogKind::ToolResult => {
+                        if let Some(preview) = &entry.read_preview {
+                            push_read_preview_lines(&mut lines, preview);
+                            lines.push(Line::from(""));
+                            continue;
+                        }
+                        if let Some(preview) = &entry.grep_preview {
+                            push_grep_preview_lines(&mut lines, preview, scroll_view_width);
+                            lines.push(Line::from(""));
+                            continue;
+                        }
+
                         let prefix_text = "[Tool Result] ";
                         let prefix_width = display_width(prefix_text);
                         let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
@@ -1167,12 +1793,11 @@ async fn run_app(
                     update_task_list_from_tool_result(&mut task_list, &name, &result);
 
                     // Mark the last running ToolCall log entry as completed
-                    if let Some(last_tool_call) = responses
-                        .iter_mut()
-                        .rev()
-                        .find(|entry| matches!(entry.kind, LogKind::ToolCall) && entry.is_running)
-                    {
-                        last_tool_call.is_running = false;
+                    let completed_tool_index = responses
+                        .iter()
+                        .rposition(|entry| matches!(entry.kind, LogKind::ToolCall) && entry.is_running);
+                    if let Some(idx) = completed_tool_index {
+                        responses[idx].is_running = false;
                     }
 
                     if !matches!(
@@ -1189,10 +1814,35 @@ async fn run_app(
                             } else {
                                 None
                             };
-                        responses.push(LogEntry::new(
-                            LogKind::ToolResult,
-                            format_tool_result(&name, &result, call_args),
-                        ));
+                        let result_map = serde_json::from_str::<serde_json::Value>(&result)
+                            .ok()
+                            .and_then(|value| value.as_object().cloned())
+                            .unwrap_or_default();
+                        if let Some(preview) = build_read_preview(&name, &result_map, call_args) {
+                            if let Some(idx) = completed_tool_index {
+                                responses[idx] = LogEntry::new_read_preview(preview);
+                            } else {
+                                responses.push(LogEntry::new_read_preview(preview));
+                            }
+                        } else if name == "grep" {
+                            if let Some(preview) = build_grep_preview(&result_map, call_args) {
+                                if let Some(idx) = completed_tool_index {
+                                    responses[idx] = LogEntry::new_grep_preview(preview);
+                                } else {
+                                    responses.push(LogEntry::new_grep_preview(preview));
+                                }
+                            } else {
+                                responses.push(LogEntry::new(
+                                    LogKind::ToolResult,
+                                    format_tool_result(&name, &result, call_args),
+                                ));
+                            }
+                        } else {
+                            responses.push(LogEntry::new(
+                                LogKind::ToolResult,
+                                format_tool_result(&name, &result, call_args),
+                            ));
+                        }
                     }
                 }
                 UiEvent::AgentFinished => {
@@ -1345,6 +1995,39 @@ mod tests {
         assert!(result.contains("10 more"));
         assert!(!result.contains("\"entries\""));
     }
+
+    #[test]
+    fn read_file_range_result_renders_code_preview_without_json() {
+        let result = format_tool_result(
+            "read_file_range",
+            r#"{"content":"line 1\nline 2\nline 3","total_lines":100}"#,
+            Some(r#"{"path":"D:\\project\\rloccle\\src\\main.rs","start_line":10,"end_line":12}"#),
+        );
+
+        assert!(result.starts_with("View D:/project/rloccle/src/main.rs"));
+        assert!(result.contains("(limit=3, offset=9)"));
+        assert!(result.contains(" 10    line 1"));
+        assert!(result.contains(" 12    line 3"));
+        assert!(result.contains("88 lines hidden"));
+        assert!(!result.contains("\"content\""));
+    }
+
+    #[test]
+    fn grep_result_renders_match_preview_without_json() {
+        let result = format_tool_result(
+            "grep",
+            r#"{"matches":[{"file":"D:\\project\\rloccle\\vibe-tui\\src\\main.rs","line":555,"content":"tokio::spawn(async move {"}]}"#,
+            Some(r#"{"query":"tokio::spawn","path":"D:\\project\\rloccle\\vibe-tui\\src\\main.rs"}"#),
+        );
+
+        assert!(result.starts_with(
+            "Grep tokio::spawn (path=D:/project/rloccle/vibe-tui/src/main.rs)"
+        ));
+        assert!(result.contains("Found 1 match"));
+        assert!(result.contains("D:/project/rloccle/vibe-tui/src/main.rs:"));
+        assert!(result.contains("Line 555, Char 1"));
+        assert!(!result.contains("\"matches\""));
+    }
 }
 
 fn format_tool_call(name: &str, args_str: &str) -> String {
@@ -1390,12 +2073,25 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
             }
             "read_file" => {
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                format!("Read file: {}", path)
+                format!("View {} (reading file)", path.replace('\\', "/"))
+            }
+            "read_file_range" => {
+                let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let start = map.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0);
+                let end = map.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0);
+                let limit = end.saturating_sub(start).saturating_add(1);
+                let offset = start.saturating_sub(1);
+                format!(
+                    "View {} (limit={}, offset={})",
+                    path.replace('\\', "/"),
+                    limit,
+                    offset
+                )
             }
             "grep" => {
                 let query = map.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                format!("Search for {:?} in {}", query, path)
+                format!("Grep {} (path={})", query, path.replace('\\', "/"))
             }
             "glob" => {
                 let pattern = map.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -1425,6 +2121,100 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
         },
         _ => format!("Run tool: {}\n{}", name, truncate_plain_text(args_str, 240)),
     }
+}
+
+fn build_read_preview(
+    name: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+    call_args_str: Option<&str>,
+) -> Option<ReadPreview> {
+    if !matches!(name, "read_file" | "read_file_range") {
+        return None;
+    }
+
+    let content = map.get("content").and_then(|v| v.as_str())?.to_string();
+    let args_value = call_args_str.and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok());
+    let path = args_value
+        .as_ref()
+        .and_then(|v| v.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    let returned_lines = content.lines().count();
+
+    if name == "read_file_range" {
+        let start_line = args_value
+            .as_ref()
+            .and_then(|v| v.get("start_line"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+        let total_lines = map
+            .get("total_lines")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        Some(ReadPreview {
+            path,
+            content,
+            start_line,
+            returned_lines,
+            total_lines,
+            is_range: true,
+        })
+    } else {
+        Some(ReadPreview {
+            path,
+            content,
+            start_line: 1,
+            returned_lines,
+            total_lines: Some(returned_lines),
+            is_range: false,
+        })
+    }
+}
+
+fn build_grep_preview(
+    map: &serde_json::Map<String, serde_json::Value>,
+    call_args_str: Option<&str>,
+) -> Option<GrepPreview> {
+    let args_value = call_args_str.and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok());
+    let query = args_value
+        .as_ref()
+        .and_then(|v| v.get("query"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let path = args_value
+        .as_ref()
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(".")
+        .to_string();
+    let raw_matches = map.get("matches").and_then(|v| v.as_array())?;
+    let shown_matches = raw_matches
+        .iter()
+        .take(RESULT_LIST_LIMIT)
+        .filter_map(|item| {
+            let file = item.get("file")?.as_str()?.to_string();
+            let line = item.get("line")?.as_u64()? as usize;
+            let content = item.get("content")?.as_str()?.to_string();
+            let char_index = find_case_insensitive_range(&content, &query)
+                .map(|(start, _)| content[..start].chars().count() + 1);
+
+            Some(GrepPreviewMatch {
+                file,
+                line,
+                content,
+                char_index,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(GrepPreview {
+        query,
+        path,
+        hidden_matches: raw_matches.len().saturating_sub(shown_matches.len()),
+        matches: shown_matches,
+    })
 }
 
 fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>) -> String {
@@ -1491,25 +2281,10 @@ fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>)
                     "Background process is still running".to_string()
                 }
             }
-            "read_file" => {
-                let content = map.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let line_count = content.lines().count();
-                let char_count = content.chars().count();
-                let path_str = call_args_str
-                    .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-                    .and_then(|v| {
-                        v.get("path")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "Unknown".to_string());
-
-                format!(
-                    "Read file successfully\n  - Path: {}\n  - Lines: {}\n  - Characters: {}",
-                    friendly_path(&path_str),
-                    line_count,
-                    char_count
-                )
+            "read_file" | "read_file_range" => {
+                build_read_preview(name, &map, call_args_str)
+                    .map(|preview| preview.to_plain_text())
+                    .unwrap_or_else(|| format_tool_fields(name, &map))
             }
             "write_file" => {
                 if map
@@ -1572,39 +2347,9 @@ fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>)
                 }
             }
             "grep" => {
-                let matches = map
-                    .get("matches")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-
-                if matches.is_empty() {
-                    "No matching lines found".to_string()
-                } else {
-                    let mut lines = vec![format!(
-                        "Found {} matching line{}",
-                        matches.len(),
-                        if matches.len() == 1 { "" } else { "s" }
-                    )];
-                    for item in matches.iter().take(RESULT_LIST_LIMIT) {
-                        let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                        let line = item.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        lines.push(format!(
-                            "  - {}:{} {}",
-                            friendly_path(file),
-                            line,
-                            truncate_plain_text(content, 160)
-                        ));
-                    }
-                    if matches.len() > RESULT_LIST_LIMIT {
-                        lines.push(format!(
-                            "  ... {} more not shown",
-                            matches.len() - RESULT_LIST_LIMIT
-                        ));
-                    }
-                    lines.join("\n")
-                }
+                build_grep_preview(&map, call_args_str)
+                    .map(|preview| preview.to_plain_text())
+                    .unwrap_or_else(|| format_tool_fields(name, &map))
             }
             "file_stat" => {
                 let size = map.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);

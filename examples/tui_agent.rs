@@ -1,4 +1,7 @@
-use loccle::{agent, InMemoryStorage, GenerateOptions, Memory, MemoryConfig, TaskSignalProvider, Task, Storage, AgentStreamEvent};
+use loccle::{
+    AgentStreamEvent, GenerateOptions, InMemoryStorage, Memory, MemoryConfig, Storage, Task,
+    TaskSignalProvider, agent,
+};
 use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -25,11 +28,11 @@ async fn draw_ui(
             let tasks: Vec<Task> = serde_json::from_value(tasks_val.clone())?;
             for task in &tasks {
                 let status_icon = match task.status.as_str() {
-                    "completed" => "\x1B[1;32m[✓]\x1B[0m", // Green checkmark
+                    "completed" => "\x1B[1;32m[✓]\x1B[0m",   // Green checkmark
                     "in_progress" => "\x1B[1;33m[▶]\x1B[0m", // Yellow play icon
-                    _ => "\x1B[90m[ ]\x1B[0m",            // Gray empty box
+                    _ => "\x1B[90m[ ]\x1B[0m",               // Gray empty box
                 };
-                
+
                 let active_text = if task.status == "in_progress" {
                     format!(" \x1B[3m(Active: {})\x1B[0m", task.active_form)
                 } else {
@@ -86,7 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let storage = Arc::new(InMemoryStorage::new());
-    let memory = Memory::new(storage.clone(), MemoryConfig { last_messages: Some(10) });
+    let memory = Memory::new(
+        storage.clone(),
+        MemoryConfig {
+            last_messages: Some(10),
+        },
+    );
 
     let test_agent = agent! {
         id: "tui-agent",
@@ -101,7 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .thread_id(thread_id)
         .resource_id("tui-user");
 
-    storage.create_thread(thread_id, Some("tui-user".to_string())).await?;
+    storage
+        .create_thread(thread_id, Some("tui-user".to_string()))
+        .await?;
 
     let mut accumulated_text = String::new();
     let mut current_action = String::from("Starting stream...");
@@ -116,25 +126,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(event) => match event {
                         AgentStreamEvent::TextDelta(text) => {
                             accumulated_text.push_str(&text);
-                            draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;
+                            draw_ui(&storage, thread_id, &accumulated_text, &current_action)
+                                .await?;
                         }
                         AgentStreamEvent::ReasoningDelta(reasoning) => {
                             current_action = format!("Thinking: {}", reasoning);
-                            draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;
+                            draw_ui(&storage, thread_id, &accumulated_text, &current_action)
+                                .await?;
                         }
-                        AgentStreamEvent::ToolCall { name, arguments, .. } => {
-                            current_action = format!("Running tool `{}` with args: {}", name, arguments);
-                            draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;
+                        AgentStreamEvent::ToolCall {
+                            name, arguments, ..
+                        } => {
+                            current_action =
+                                format!("Running tool `{}` with args: {}", name, arguments);
+                            draw_ui(&storage, thread_id, &accumulated_text, &current_action)
+                                .await?;
                         }
                         AgentStreamEvent::ToolResult { name, .. } => {
                             current_action = format!("Tool `{}` finished execution", name);
-                            draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;
+                            draw_ui(&storage, thread_id, &accumulated_text, &current_action)
+                                .await?;
                         }
                         AgentStreamEvent::Finish { .. } => {
                             current_action = "Completed!".to_string();
-                            draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;
+                            draw_ui(&storage, thread_id, &accumulated_text, &current_action)
+                                .await?;
                         }
-                    }
+                    },
                     Err(e) => {
                         current_action = format!("Error: {}", e);
                         draw_ui(&storage, thread_id, &accumulated_text, &current_action).await?;

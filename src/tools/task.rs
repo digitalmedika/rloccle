@@ -1,8 +1,8 @@
-use crate::tool::create_tool;
 use crate::memory::Memory;
 use crate::tool::Tool;
-use serde::{Deserialize, Serialize};
+use crate::tool::create_tool;
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
@@ -89,9 +89,9 @@ pub fn task_write_tool() -> impl Tool {
             for (idx, task_in) in args.tasks.into_iter().enumerate() {
                 let id = task_in.id.unwrap_or_else(|| format!("task-{}", idx + 1));
                 let status = task_in.status.unwrap_or_else(|| "pending".to_string());
-                let active_form = task_in.active_form.unwrap_or_else(|| {
-                    format!("Working on: {}", task_in.content)
-                });
+                let active_form = task_in
+                    .active_form
+                    .unwrap_or_else(|| format!("Working on: {}", task_in.content));
                 final_tasks.push(Task {
                     id,
                     content: task_in.content,
@@ -111,7 +111,11 @@ pub fn task_write_tool() -> impl Tool {
                 }
             };
 
-            if let Err(e) = memory.storage().update_thread_state(&thread_id, "tasks".to_string(), value).await {
+            if let Err(e) = memory
+                .storage()
+                .update_thread_state(&thread_id, "tasks".to_string(), value)
+                .await
+            {
                 return Ok(TaskWriteOutput {
                     success: false,
                     error: Some(format!("Failed to save tasks: {}", e)),
@@ -124,7 +128,7 @@ pub fn task_write_tool() -> impl Tool {
                 error: None,
                 tasks: final_tasks,
             })
-        }
+        },
     )
 }
 
@@ -195,7 +199,9 @@ pub fn task_update_tool() -> impl Tool {
                 }
             };
 
-            let mut tasks: Vec<Task> = session.state.get("tasks")
+            let mut tasks: Vec<Task> = session
+                .state
+                .get("tasks")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
@@ -225,7 +231,11 @@ pub fn task_update_tool() -> impl Tool {
             }
 
             let value = serde_json::to_value(&tasks).unwrap();
-            if let Err(e) = memory.storage().update_thread_state(&thread_id, "tasks".to_string(), value).await {
+            if let Err(e) = memory
+                .storage()
+                .update_thread_state(&thread_id, "tasks".to_string(), value)
+                .await
+            {
                 return Ok(TaskUpdateOutput {
                     success: false,
                     error: Some(format!("Failed to save tasks: {}", e)),
@@ -238,7 +248,7 @@ pub fn task_update_tool() -> impl Tool {
                 error: None,
                 task: updated_task,
             })
-        }
+        },
     )
 }
 
@@ -305,7 +315,9 @@ pub fn task_complete_tool() -> impl Tool {
                 }
             };
 
-            let mut tasks: Vec<Task> = session.state.get("tasks")
+            let mut tasks: Vec<Task> = session
+                .state
+                .get("tasks")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
@@ -327,7 +339,11 @@ pub fn task_complete_tool() -> impl Tool {
             }
 
             let value = serde_json::to_value(&tasks).unwrap();
-            if let Err(e) = memory.storage().update_thread_state(&thread_id, "tasks".to_string(), value).await {
+            if let Err(e) = memory
+                .storage()
+                .update_thread_state(&thread_id, "tasks".to_string(), value)
+                .await
+            {
                 return Ok(TaskCompleteOutput {
                     success: false,
                     error: Some(format!("Failed to save tasks: {}", e)),
@@ -340,7 +356,7 @@ pub fn task_complete_tool() -> impl Tool {
                 error: None,
                 task: updated_task,
             })
-        }
+        },
     )
 }
 
@@ -410,7 +426,9 @@ pub fn task_check_tool() -> impl Tool {
                 }
             };
 
-            let tasks: Vec<Task> = session.state.get("tasks")
+            let tasks: Vec<Task> = session
+                .state
+                .get("tasks")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
@@ -422,6 +440,6 @@ pub fn task_check_tool() -> impl Tool {
                 tasks,
                 all_completed,
             })
-        }
+        },
     )
 }

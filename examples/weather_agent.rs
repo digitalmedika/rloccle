@@ -1,6 +1,6 @@
-use loccle::{agent, create_tool, Tool};
-use serde::{Deserialize, Serialize};
+use loccle::{Tool, agent, create_tool};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 
@@ -35,19 +35,30 @@ async fn main() {
         "weather-tool",
         "Fetches weather for a location",
         |args| async move {
-            println!("[Tool executing] weather-tool: fetching weather for {}", args.location);
-            
+            println!(
+                "[Tool executing] weather-tool: fetching weather for {}",
+                args.location
+            );
+
             // Simulating weather fetch
             let weather_info = format!("Weather in {} is sunny and 72°F", args.location);
-            Ok(WeatherOutput { weather: weather_info })
-        }
+            Ok(WeatherOutput {
+                weather: weather_info,
+            })
+        },
     );
 
     // Print the generated JSON schema to verify it works
     println!("=== Generated Input Schema ===");
-    println!("{}", serde_json::to_string_pretty(&weather_tool.input_schema()).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&weather_tool.input_schema()).unwrap()
+    );
     println!("=== Generated Output Schema ===");
-    println!("{}", serde_json::to_string_pretty(&weather_tool.output_schema().unwrap()).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&weather_tool.output_schema().unwrap()).unwrap()
+    );
 
     // 2. Define an Agent and register our weather_tool
     println!("\n=== Creating Weather Agent ===");

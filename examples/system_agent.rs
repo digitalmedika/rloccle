@@ -1,4 +1,7 @@
-use loccle::{agent, tools::{all_fs_tools, all_system_tools}};
+use loccle::{
+    agent,
+    tools::{all_fs_tools, all_system_tools},
+};
 use std::env;
 
 #[tokio::main]
@@ -38,7 +41,7 @@ async fn main() {
                   3. Check the stats of 'temp_agent_dir' using file_stat. \
                   4. Delete 'temp_agent_dir' using delete. \
                   Provide a brief summary of what happened.";
-    
+
     println!("User: {}", prompt);
 
     match system_agent.generate(prompt).await {

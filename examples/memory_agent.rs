@@ -1,4 +1,4 @@
-use loccle::{agent, FileStorage, GenerateOptions, Memory, MemoryConfig};
+use loccle::{FileStorage, GenerateOptions, Memory, MemoryConfig, agent};
 use std::env;
 use std::fs;
 use std::sync::Arc;
@@ -18,9 +18,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 1. Configure local file storage for memory
     let memory_dir = "./target/memory_test";
-    println!("=== 1. Initializing Memory & FileStorage at {} ===", memory_dir);
+    println!(
+        "=== 1. Initializing Memory & FileStorage at {} ===",
+        memory_dir
+    );
     let storage = Arc::new(FileStorage::new(memory_dir));
-    let memory = Memory::new(storage, MemoryConfig { last_messages: Some(10) });
+    let memory = Memory::new(
+        storage,
+        MemoryConfig {
+            last_messages: Some(10),
+        },
+    );
 
     // 2. Build the Agent with the Memory configuration
     println!("\n=== 2. Building Agent with Memory ===");
@@ -43,13 +51,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n=== 3. First Turn: Introducing user ===");
     let prompt1 = "Hi, my name is Billy.";
     println!("User: {}", prompt1);
-    
-    match test_agent.generate_with_options(prompt1, options.clone()).await {
+
+    match test_agent
+        .generate_with_options(prompt1, options.clone())
+        .await
+    {
         Ok(res) => {
             println!("Agent: {}", res);
         }
         Err(e) => {
-            println!("Execution Note: Could not get response (likely due to invalid API key): {}", e);
+            println!(
+                "Execution Note: Could not get response (likely due to invalid API key): {}",
+                e
+            );
             return Ok(());
         }
     }
@@ -57,8 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("\n=== 4. Second Turn: Asking follow-up question ===");
     let prompt2 = "What is my name?";
     println!("User: {}", prompt2);
-    
-    match test_agent.generate_with_options(prompt2, options.clone()).await {
+
+    match test_agent
+        .generate_with_options(prompt2, options.clone())
+        .await
+    {
         Ok(res) => {
             println!("Agent: {}", res);
         }
@@ -74,7 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(&json_path)?;
         println!("Stored thread content:\n{}", content);
     } else {
-        println!("No storage file found at {}. (Maybe mock key was used and no API call was made?)", json_path);
+        println!(
+            "No storage file found at {}. (Maybe mock key was used and no API call was made?)",
+            json_path
+        );
     }
 
     // Cleanup the test memory dir

@@ -1,4 +1,4 @@
-use crate::tool::{create_tool, BoxError};
+use crate::tool::{BoxError, create_tool};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -55,7 +55,9 @@ pub fn read_file_range_tool() -> impl crate::Tool {
                 return Err(simple_error("start_line must be greater than 0"));
             }
             if args.end_line < args.start_line {
-                return Err(simple_error("end_line must be greater than or equal to start_line"));
+                return Err(simple_error(
+                    "end_line must be greater than or equal to start_line",
+                ));
             }
 
             let content = fs::read_to_string(&args.path)?;
@@ -66,7 +68,8 @@ pub fn read_file_range_tool() -> impl crate::Tool {
                 .enumerate()
                 .filter_map(|(idx, line)| {
                     let line_number = idx + 1;
-                    (line_number >= args.start_line && line_number <= args.end_line).then_some(*line)
+                    (line_number >= args.start_line && line_number <= args.end_line)
+                        .then_some(*line)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -190,7 +193,9 @@ pub fn replace_lines_tool() -> impl crate::Tool {
                 return Err(simple_error("start_line must be greater than 0"));
             }
             if args.end_line < args.start_line {
-                return Err(simple_error("end_line must be greater than or equal to start_line"));
+                return Err(simple_error(
+                    "end_line must be greater than or equal to start_line",
+                ));
             }
 
             let content = fs::read_to_string(&args.path)?;
@@ -210,10 +215,7 @@ pub fn replace_lines_tool() -> impl crate::Tool {
                 args.replacement.lines().map(ToString::to_string).collect()
             };
             let replaced_lines = args.end_line - args.start_line + 1;
-            lines.splice(
-                (args.start_line - 1)..args.end_line,
-                replacement_lines,
-            );
+            lines.splice((args.start_line - 1)..args.end_line, replacement_lines);
 
             let mut updated = lines.join("\n");
             if had_trailing_newline && !updated.ends_with('\n') {

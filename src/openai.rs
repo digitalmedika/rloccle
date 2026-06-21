@@ -198,7 +198,9 @@ impl OpenAIStream {
         }
     }
 
-    pub async fn next(&mut self) -> Option<Result<ChatCompletionChunk, Box<dyn std::error::Error + Send + Sync>>> {
+    pub async fn next(
+        &mut self,
+    ) -> Option<Result<ChatCompletionChunk, Box<dyn std::error::Error + Send + Sync>>> {
         if self.done {
             return None;
         }
@@ -224,7 +226,8 @@ impl OpenAIStream {
                             return Some(Err(format!(
                                 "Failed to parse stream chunk JSON: {}. Raw data: {}",
                                 e, data
-                            ).into()));
+                            )
+                            .into()));
                         }
                     }
                 }
@@ -292,7 +295,9 @@ impl OpenAIClient {
         messages: Vec<ChatMessage>,
         temperature: Option<f32>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = self.chat_completion_raw(model, messages, temperature, None).await?;
+        let resp = self
+            .chat_completion_raw(model, messages, temperature, None)
+            .await?;
         Ok(resp.content.unwrap_or_default())
     }
 
@@ -308,7 +313,7 @@ impl OpenAIClient {
             base = format!("{}/v1", base);
         }
         let url = format!("{}/chat/completions", base);
-        
+
         let (_, model_name) = Self::parse_model_string(model);
 
         let request = ChatCompletionRequest {
@@ -346,7 +351,8 @@ impl OpenAIClient {
                 return Err(format!(
                     "Failed to deserialize response body: {}. Raw response: {}",
                     e, text
-                ).into());
+                )
+                .into());
             }
         };
 
@@ -369,7 +375,7 @@ impl OpenAIClient {
             base = format!("{}/v1", base);
         }
         let url = format!("{}/chat/completions", base);
-        
+
         let (_, model_name) = Self::parse_model_string(model);
 
         let request = ChatCompletionRequest {

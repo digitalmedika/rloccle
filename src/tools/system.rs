@@ -1,10 +1,10 @@
 use crate::tool::create_tool;
-use serde::{Deserialize, Serialize};
-use schemars::JsonSchema;
-use std::process::{Command, Stdio, Child};
-use std::sync::Mutex;
-use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 
 static PROCESSES: Lazy<Mutex<HashMap<u32, Child>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -42,12 +42,12 @@ pub fn execute_command_tool() -> impl crate::Tool {
                     .stderr(Stdio::piped())
                     .spawn()?;
                 let pid = child.id();
-                
+
                 {
                     let mut lock = PROCESSES.lock().unwrap();
                     lock.insert(pid, child);
                 }
-                
+
                 Ok(ExecuteCommandOutput {
                     pid: Some(pid),
                     exit_code: None,
@@ -55,14 +55,12 @@ pub fn execute_command_tool() -> impl crate::Tool {
                     stderr: None,
                 })
             } else {
-                let output = Command::new(&args.command)
-                    .args(&args.args)
-                    .output()?;
-                
+                let output = Command::new(&args.command).args(&args.args).output()?;
+
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                 let exit_code = output.status.code();
-                
+
                 Ok(ExecuteCommandOutput {
                     pid: None,
                     exit_code,
@@ -70,7 +68,7 @@ pub fn execute_command_tool() -> impl crate::Tool {
                     stderr: Some(stderr),
                 })
             }
-        }
+        },
     )
 }
 
@@ -100,10 +98,14 @@ pub fn get_process_output_tool() -> impl crate::Tool {
                 if lock.contains_key(&args.pid) {
                     lock.remove(&args.pid).unwrap()
                 } else {
-                    return Err(format!("Process with PID {} not found or has already been collected", args.pid).into());
+                    return Err(format!(
+                        "Process with PID {} not found or has already been collected",
+                        args.pid
+                    )
+                    .into());
                 }
             };
-            
+
             // Check status without blocking
             match child.try_wait()? {
                 Some(status) => {
@@ -132,7 +134,7 @@ pub fn get_process_output_tool() -> impl crate::Tool {
                     })
                 }
             }
-        }
+        },
     )
 }
 
@@ -161,6 +163,6 @@ pub fn kill_process_tool() -> impl crate::Tool {
             } else {
                 Err(format!("Process with PID {} not found", args.pid).into())
             }
-        }
+        },
     )
 }

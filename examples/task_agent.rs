@@ -1,4 +1,7 @@
-use loccle::{agent, InMemoryStorage, GenerateOptions, Memory, MemoryConfig, TaskSignalProvider, Task, Storage, AgentStreamEvent};
+use loccle::{
+    AgentStreamEvent, GenerateOptions, InMemoryStorage, Memory, MemoryConfig, Storage, Task,
+    TaskSignalProvider, agent,
+};
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
@@ -9,9 +12,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = dotenvy::dotenv();
 
     // Check if real API key is set
-    let api_key_is_dummy = env::var("OPENAI_API_KEY").is_err() || env::var("OPENAI_API_KEY").unwrap() == "sk-dummy-key-for-compilation";
+    let api_key_is_dummy = env::var("OPENAI_API_KEY").is_err()
+        || env::var("OPENAI_API_KEY").unwrap() == "sk-dummy-key-for-compilation";
     if api_key_is_dummy {
-        println!("Notice: OPENAI_API_KEY is not set or is dummy. Setting dummy key for compilation check.");
+        println!(
+            "Notice: OPENAI_API_KEY is not set or is dummy. Setting dummy key for compilation check."
+        );
         unsafe {
             env::set_var("OPENAI_API_KEY", "sk-dummy-key-for-compilation");
         }
@@ -19,7 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("=== 1. Initializing Memory & Storage ===");
     let storage = Arc::new(InMemoryStorage::new());
-    let memory = Memory::new(storage.clone(), MemoryConfig { last_messages: Some(10) });
+    let memory = Memory::new(
+        storage.clone(),
+        MemoryConfig {
+            last_messages: Some(10),
+        },
+    );
 
     println!("\n=== 2. Building Agent with Memory and TaskSignalProvider ===");
     let test_agent = agent! {
@@ -35,7 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if api_key_is_dummy {
         println!("\n[INFO] Skipping live LLM run because a real OPENAI_API_KEY is not configured.");
-        println!("Configure OPENAI_API_KEY in your .env or environment to run the live task tracking stream.");
+        println!(
+            "Configure OPENAI_API_KEY in your .env or environment to run the live task tracking stream."
+        );
         println!("Compilation check successful.");
         return Ok(());
     }
@@ -46,11 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .resource_id("billy-user");
 
     // Create the thread session in storage
-    storage.create_thread(thread_id, Some("billy-user".to_string())).await?;
+    storage
+        .create_thread(thread_id, Some("billy-user".to_string()))
+        .await?;
 
     println!("\n=== 3. Starting live Agent Task Orchestration Stream ===");
     let prompt = "Please create a task list to research top 3 Rust databases, compare them, and verify the results. Then go ahead and execute each task one by one, updating the task status using the tools (e.g. setting them to in_progress and then completed) as you proceed.";
-    
+
     println!("User prompt: {}\n", prompt);
     println!("--- Streaming Response ---");
 
@@ -67,7 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             print!("[Reasoning: {}]", reasoning);
                             let _ = std::io::stdout().flush();
                         }
-                        AgentStreamEvent::ToolCall { id, name, arguments } => {
+                        AgentStreamEvent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             println!("\n\n[Agent Call Tool] => {} (ID: {})", name, id);
                             println!("Arguments: {}", arguments);
                         }
@@ -78,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         AgentStreamEvent::Finish { finish_reason, .. } => {
                             println!("\n[Stream Event] Finish Reason: {:?}", finish_reason);
                         }
-                    }
+                    },
                     Err(e) => {
                         println!("\nError in stream: {}", e);
                     }
@@ -97,7 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let tasks: Vec<Task> = serde_json::from_value(tasks_val.clone())?;
             println!("Final Thread state tasks list:");
             for task in tasks {
-                println!("- [{}] ID: {}, Status: {}, ActiveForm: '{}'", task.content, task.id, task.status, task.active_form);
+                println!(
+                    "- [{}] ID: {}, Status: {}, ActiveForm: '{}'",
+                    task.content, task.id, task.status, task.active_form
+                );
             }
         } else {
             println!("No tasks found in thread session state.");
