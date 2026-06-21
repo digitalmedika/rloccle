@@ -1,4 +1,4 @@
-﻿use crossterm::{
+use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -17,9 +17,13 @@ use ratatui::{
 };
 use std::env;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const RESULT_PREVIEW_LIMIT: usize = 1200;
+const RESULT_LIST_LIMIT: usize = 12;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -89,6 +93,99 @@ fn bounded_title(title: &str, area_width: u16) -> String {
     }
 
     format!(" {} ", truncate_to_width(title, max_width - 2))
+}
+
+fn friendly_path(path: &str) -> String {
+    let path_value = Path::new(path);
+    let current_dir = env::current_dir().ok();
+    let workspace_dir = current_dir.as_ref().and_then(|cwd| {
+        if cwd.file_name().and_then(|name| name.to_str()) == Some("vibe-tui") {
+            cwd.parent().map(|parent| parent.to_path_buf())
+        } else {
+            Some(cwd.to_path_buf())
+        }
+    });
+
+    if let Some(workspace) = workspace_dir {
+        if let Ok(relative) = path_value.strip_prefix(workspace) {
+            return relative.to_string_lossy().into_owned();
+        }
+    }
+
+    path.to_string()
+}
+
+fn json_string_array<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<&'a str> {
+    map.get(key)
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
+        .unwrap_or_default()
+}
+
+fn format_path_list(label: &str, paths: &[&str], extra_count: usize) -> String {
+    let mut lines = vec![format!(
+        "{} (showing {} of {})",
+        label,
+        paths.len().min(RESULT_LIST_LIMIT),
+        paths.len() + extra_count
+    )];
+
+    for path in paths.iter().take(RESULT_LIST_LIMIT) {
+        lines.push(format!("  - {}", friendly_path(path)));
+    }
+
+    let hidden_count = paths.len().saturating_sub(RESULT_LIST_LIMIT) + extra_count;
+    if hidden_count > 0 {
+        lines.push(format!("  ... {} more not shown", hidden_count));
+    }
+
+    lines.join("\n")
+}
+
+fn truncate_plain_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+
+    let mut output: String = text.chars().take(limit).collect();
+    output.push_str(&format!("\n... truncated after {} characters", limit));
+    output
+}
+
+fn summarize_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "empty".to_string(),
+        serde_json::Value::Bool(v) => v.to_string(),
+        serde_json::Value::Number(v) => v.to_string(),
+        serde_json::Value::String(v) => {
+            if v.contains('\\') || v.contains('/') {
+                friendly_path(v)
+            } else {
+                truncate_plain_text(v, 120)
+            }
+        }
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                "0 items".to_string()
+            } else {
+                format!("{} items", items.len())
+            }
+        }
+        serde_json::Value::Object(map) => format!("{} fields", map.len()),
+    }
+}
+
+fn format_tool_fields(name: &str, map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut lines = vec![format!("{} completed:", name)];
+
+    for (key, value) in map {
+        lines.push(format!("  - {}: {}", key, summarize_json_value(value)));
+    }
+
+    lines.join("\n")
 }
 
 fn update_task_list_from_tool_result(tasks: &mut Vec<TuiTask>, tool_name: &str, result: &str) {
@@ -952,6 +1049,32 @@ mod tests {
         assert!(display_width(&truncated) <= 12);
         assert!(truncated.ends_with("..."));
     }
+
+    #[test]
+    fn glob_call_and_result_are_human_readable() {
+        let call = format_tool_call("glob", r#"{"pattern":"D:\\project\\rloccle\\**\\*.rs"}"#);
+        let result = format_tool_result(
+            "glob",
+            r#"{"paths":["D:\\project\\rloccle\\src\\agent.rs","D:\\project\\rloccle\\src\\tool.rs"]}"#,
+        );
+
+        assert!(call.starts_with("Find files matching:"));
+        assert!(result.starts_with("Matched files"));
+        assert!(!call.contains("{\""));
+        assert!(!result.contains("{\""));
+    }
+
+    #[test]
+    fn list_dir_result_summarizes_entries_without_json() {
+        let result = format_tool_result(
+            "list_dir",
+            r#"{"entries":["D:\\project\\rloccle\\.agents","D:\\project\\rloccle\\.env"],"remaining_count":10}"#,
+        );
+
+        assert!(result.starts_with("Directory entries"));
+        assert!(result.contains("10 more"));
+        assert!(!result.contains("\"entries\""));
+    }
 }
 
 fn format_tool_call(name: &str, args_str: &str) -> String {
@@ -995,9 +1118,33 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 format!("Search for {:?} in {}", query, path)
             }
-            _ => format!("{} {}", name, args_str),
+            "glob" => {
+                let pattern = map.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                format!("Find files matching: {}", friendly_path(pattern))
+            }
+            "list_dir" => {
+                let path = map.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                format!("List directory: {}", friendly_path(path))
+            }
+            "file_stat" => {
+                let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                format!("Inspect file: {}", friendly_path(path))
+            }
+            "mkdir" => {
+                let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                format!("Create directory: {}", friendly_path(path))
+            }
+            "get_process_output" => {
+                let pid = map.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("Check background process: PID {}", pid)
+            }
+            "kill_process" => {
+                let pid = map.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("Stop background process: PID {}", pid)
+            }
+            _ => format_tool_fields(name, &map),
         },
-        _ => format!("{} {}", name, args_str),
+        _ => format!("Run tool: {}\n{}", name, truncate_plain_text(args_str, 240)),
     }
 }
 
@@ -1008,17 +1155,197 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
             "execute_command" => {
                 let stdout = map.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                 let stderr = map.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-                let code = map.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
-                if code == 0 {
-                    format!("Success (exit code 0)\n{}", stdout.trim())
+                let pid = map.get("pid").and_then(|v| v.as_u64());
+                let code = map.get("exit_code").and_then(|v| v.as_i64());
+
+                if let Some(pid) = pid {
+                    format!("Started background process\n  - PID: {}", pid)
+                } else if code == Some(0) {
+                    let output = stdout.trim();
+                    if output.is_empty() {
+                        "Command succeeded (exit code 0)".to_string()
+                    } else {
+                        format!(
+                            "Command succeeded (exit code 0)\n{}",
+                            truncate_plain_text(output, RESULT_PREVIEW_LIMIT)
+                        )
+                    }
                 } else {
                     format!(
                         "Failed (exit code {})\nOutput:\n{}\nError:\n{}",
-                        code,
-                        stdout.trim(),
-                        stderr.trim()
+                        code.map(|v| v.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        truncate_plain_text(stdout.trim(), RESULT_PREVIEW_LIMIT),
+                        truncate_plain_text(stderr.trim(), RESULT_PREVIEW_LIMIT)
                     )
                 }
+            }
+            "get_process_output" => {
+                let finished = map
+                    .get("finished")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let stdout = map.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                let stderr = map.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                let code = map.get("exit_code").and_then(|v| v.as_i64());
+
+                if finished {
+                    let mut lines = vec![format!(
+                        "Background process finished{}",
+                        code.map(|v| format!(" (exit code {})", v))
+                            .unwrap_or_default()
+                    )];
+                    if !stdout.trim().is_empty() {
+                        lines.push(format!(
+                            "Output:\n{}",
+                            truncate_plain_text(stdout.trim(), RESULT_PREVIEW_LIMIT)
+                        ));
+                    }
+                    if !stderr.trim().is_empty() {
+                        lines.push(format!(
+                            "Error:\n{}",
+                            truncate_plain_text(stderr.trim(), RESULT_PREVIEW_LIMIT)
+                        ));
+                    }
+                    lines.join("\n")
+                } else {
+                    "Background process is still running".to_string()
+                }
+            }
+            "read_file" => {
+                let content = map.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let line_count = content.lines().count();
+                let char_count = content.chars().count();
+                let preview = truncate_plain_text(content.trim(), RESULT_PREVIEW_LIMIT);
+                if preview.is_empty() {
+                    format!(
+                        "Read file successfully\n  - Lines: {}\n  - Characters: {}",
+                        line_count, char_count
+                    )
+                } else {
+                    format!(
+                        "Read file successfully\n  - Lines: {}\n  - Characters: {}\nPreview:\n{}",
+                        line_count, char_count, preview
+                    )
+                }
+            }
+            "write_file" => {
+                if map
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    "File written successfully".to_string()
+                } else {
+                    "File write finished with unknown status".to_string()
+                }
+            }
+            "delete" => {
+                if map
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    "Deleted successfully".to_string()
+                } else {
+                    "Delete finished with unknown status".to_string()
+                }
+            }
+            "mkdir" => {
+                if map
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    "Directory created successfully".to_string()
+                } else {
+                    "Directory creation finished with unknown status".to_string()
+                }
+            }
+            "kill_process" => {
+                if map
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    "Process stopped successfully".to_string()
+                } else {
+                    "Process stop finished with unknown status".to_string()
+                }
+            }
+            "list_dir" => {
+                let entries = json_string_array(&map, "entries");
+                let remaining_count = map
+                    .get("remaining_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                format_path_list("Directory entries", &entries, remaining_count)
+            }
+            "glob" => {
+                let paths = json_string_array(&map, "paths");
+                if paths.is_empty() {
+                    "No files matched the pattern".to_string()
+                } else {
+                    format_path_list("Matched files", &paths, 0)
+                }
+            }
+            "grep" => {
+                let matches = map
+                    .get("matches")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                if matches.is_empty() {
+                    "No matching lines found".to_string()
+                } else {
+                    let mut lines = vec![format!(
+                        "Found {} matching line{}",
+                        matches.len(),
+                        if matches.len() == 1 { "" } else { "s" }
+                    )];
+                    for item in matches.iter().take(RESULT_LIST_LIMIT) {
+                        let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                        let line = item.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        lines.push(format!(
+                            "  - {}:{} {}",
+                            friendly_path(file),
+                            line,
+                            truncate_plain_text(content, 160)
+                        ));
+                    }
+                    if matches.len() > RESULT_LIST_LIMIT {
+                        lines.push(format!(
+                            "  ... {} more not shown",
+                            matches.len() - RESULT_LIST_LIMIT
+                        ));
+                    }
+                    lines.join("\n")
+                }
+            }
+            "file_stat" => {
+                let size = map.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                let is_dir = map.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_file = map
+                    .get("is_file")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let modified = map
+                    .get("modified_time")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let kind = if is_dir {
+                    "directory"
+                } else if is_file {
+                    "file"
+                } else {
+                    "path"
+                };
+                format!(
+                    "File info\n  - Type: {}\n  - Size: {} bytes\n  - Modified: {}",
+                    kind, size, modified
+                )
             }
             "task_write" | "task_check" => {
                 if let Some(tasks) = map.get("tasks").and_then(|v| v.as_array()) {
@@ -1050,21 +1377,22 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                     let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     format!("Updated task #{} to [{}] - {}", id, status, content)
                 } else {
-                    truncate_result(result_str)
+                    format_tool_fields(name, &map)
                 }
             }
-            _ => truncate_result(result_str),
+            _ => format_tool_fields(name, &map),
         },
         _ => truncate_result(result_str),
     }
 }
 
 fn truncate_result(result_str: &str) -> String {
-    if result_str.len() > 1000 {
+    if result_str.chars().count() > RESULT_PREVIEW_LIMIT {
         format!(
-            "Result (truncated to 1000 of {} characters):\n{}",
-            result_str.len(),
-            &result_str[..1000]
+            "Result preview (truncated to {} of {} characters):\n{}",
+            RESULT_PREVIEW_LIMIT,
+            result_str.chars().count(),
+            truncate_plain_text(result_str, RESULT_PREVIEW_LIMIT)
         )
     } else {
         result_str.to_string()
