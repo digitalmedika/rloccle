@@ -13,9 +13,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use tachyonfx::{Effect, EffectRenderer, EffectTimer, Interpolation};
 use std::env;
 use std::io;
 use std::path::Path;
@@ -29,7 +28,6 @@ const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
 const TOOL_PROGRESS_WIDTH: usize = 28;
 const TOOL_PROGRESS_TICK_MS: u64 = 120;
-const EFFECT_TICK_MS: u64 = 50;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -46,6 +44,25 @@ enum LogKind {
 struct LogEntry {
     kind: LogKind,
     text: String,
+    is_running: bool,
+}
+
+impl LogEntry {
+    fn new(kind: LogKind, text: String) -> Self {
+        Self {
+            kind,
+            text,
+            is_running: false,
+        }
+    }
+
+    fn new_tool_call(text: String) -> Self {
+        Self {
+            kind: LogKind::ToolCall,
+            text,
+            is_running: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -362,26 +379,7 @@ fn animated_progress_line(tool: &ActiveToolProgress) -> String {
     )
 }
 
-fn render_tool_progress(f: &mut ratatui::Frame, area: Rect, tool: &ActiveToolProgress) {
-    let title = bounded_title(&format!("Tool Progress: {}", tool.name), area.width);
-    let ratio = ((tool.tick % 100) as f64) / 100.0;
-    let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .gauge_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .label(animated_progress_line(tool))
-        .ratio(ratio);
-    f.render_widget(gauge, area);
-}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -465,7 +463,6 @@ enum UiEvent {
     AgentFinished,
     AgentError(String),
     Tick,
-    EffectTick,
 }
 
 #[tokio::main]
@@ -582,25 +579,15 @@ async fn run_app(
         }
     });
 
-    // Spawn effect ticker for tachyonfx loading indicator animations
-    let tx_effect = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(EFFECT_TICK_MS));
-        loop {
-            interval.tick().await;
-            if tx_effect.send(UiEvent::EffectTick).await.is_err() {
-                break;
-            }
-        }
-    });
+
 
     // App state
     let mut input_buffer = String::new();
     let mut responses: Vec<LogEntry> = vec![
-        LogEntry {
-            kind: LogKind::Info,
-            text: "Welcome to Vibe-TUI Agent Checklist! Enter your request below to plan and execute coding tasks. Type /new to start a fresh session, /sessions to browse sessions.".to_string(),
-        }
+        LogEntry::new(
+            LogKind::Info,
+            "Welcome to Vibe-TUI Agent Checklist! Enter your request below to plan and execute coding tasks. Type /new to start a fresh session, /sessions to browse sessions.".to_string(),
+        )
     ];
     let mut scroll_offset: u16 = 0;
     let mut auto_scroll = true;
@@ -610,27 +597,21 @@ async fn run_app(
     let mut last_tool_call_args: Option<(String, String)> = None;
     let mut active_tool_progress: Option<ActiveToolProgress> = None;
 
-    // Tachyonfx loading effect state
-    let mut loading_effect: Option<Effect> = None;
-    let mut last_effect_tick = Duration::ZERO;
-
     loop {
         // Draw the terminal
         terminal.draw(|f| {
             let size = f.size();
 
+            let input_inner_width = size.width.saturating_sub(2) as usize;
+            let input_line_count = wrap_text(&input_buffer, input_inner_width)
+                .len()
+                .max(1) as u16;
+            let input_height = input_line_count.saturating_add(2).min(size.height.saturating_sub(8).max(3));
+
             // Layout: main content area (scroll view) + input area at the bottom
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints(if active_tool_progress.is_some() {
-                    vec![
-                        Constraint::Min(8),
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                    ]
-                } else {
-                    vec![Constraint::Min(8), Constraint::Length(3)]
-                })
+                .constraints(vec![Constraint::Min(8), Constraint::Length(input_height)])
                 .split(size);
 
             let content_chunks = Layout::default()
@@ -726,8 +707,18 @@ async fn run_app(
                         }
                     }
                     LogKind::ToolCall => {
-                        let prefix_text = "[Tool Call] ";
-                        let prefix_width = display_width(prefix_text);
+                        let is_running = entry.is_running;
+                        let prefix_text = if is_running {
+                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                            let spinner = active_tool_progress
+                                .as_ref()
+                                .map(|p| frames[(p.tick as usize) % frames.len()])
+                                .unwrap_or("⠋");
+                            format!("{} ", spinner)
+                        } else {
+                            "✓ ".to_string()
+                        };
+                        let prefix_width = display_width(&prefix_text);
                         let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
@@ -744,13 +735,17 @@ async fn run_app(
                             };
 
                             if first {
+                                let prefix_style = if is_running {
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default()
+                                        .fg(Color::Green)
+                                        .add_modifier(Modifier::BOLD)
+                                };
                                 lines.push(Line::from(vec![
-                                    Span::styled(
-                                        prefix_text,
-                                        Style::default()
-                                            .fg(Color::Yellow)
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
+                                    Span::styled(prefix_text.clone(), prefix_style),
                                     Span::styled(part, line_style),
                                 ]));
                                 first = false;
@@ -892,11 +887,7 @@ async fn run_app(
             f.render_widget(scroll_view, content_chunks[0]);
             render_task_panel(f, content_chunks[1], &task_list, is_streaming);
 
-            // Render tachyonfx loading effect on the scroll panel when tool is active
-            if let Some(ref mut effect) = loading_effect {
-                let scroll_area = content_chunks[0];
-                f.render_effect(effect, scroll_area, last_effect_tick);
-            }
+
 
             // 2. Render input prompt
             let input_style = if is_streaming {
@@ -913,6 +904,7 @@ async fn run_app(
 
             let input_paragraph = Paragraph::new(input_buffer.as_str())
                 .style(input_style)
+                .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -926,9 +918,7 @@ async fn run_app(
 
             f.render_widget(input_paragraph, chunks[1]);
 
-            if let Some(tool_progress) = &active_tool_progress {
-                render_tool_progress(f, chunks[2], tool_progress);
-            }
+
 
             if sessions_overlay {
                 render_sessions_overlay(f, size, &sessions, selected_session, &thread_id);
@@ -944,11 +934,7 @@ async fn run_app(
                         current_action = animated_progress_line(tool_progress);
                     }
                 }
-                UiEvent::EffectTick => {
-                    if loading_effect.is_some() {
-                        last_effect_tick += Duration::from_millis(EFFECT_TICK_MS);
-                    }
-                }
+
                 UiEvent::Mouse(mouse) => match mouse.kind {
                     event::MouseEventKind::ScrollUp => {
                         auto_scroll = false;
@@ -979,7 +965,7 @@ async fn run_app(
                                     scroll_offset = 0;
                                     auto_scroll = true;
                                     current_action = format!("Loaded session {}", thread_id);
-                                    responses.push(LogEntry { kind: LogKind::Info, text: format!("Loaded session {}. New prompts will continue this conversation context.", thread_id) });
+                                    responses.push(LogEntry::new(LogKind::Info, format!("Loaded session {}. New prompts will continue this conversation context.", thread_id)));
                                 }
                                 sessions_overlay = false;
                             }
@@ -1019,20 +1005,20 @@ async fn run_app(
                                     scroll_offset = 0;
                                     auto_scroll = true;
                                     current_action = "Started a new session".to_string();
-                                    responses.push(LogEntry {
-                                        kind: LogKind::Info,
-                                        text: format!(
+                                    responses.push(LogEntry::new(
+                                        LogKind::Info,
+                                        format!(
                                             "Started a fresh session ({}). Previous conversation and task list were cleared.",
                                             thread_id
                                         ),
-                                    });
+                                    ));
                                     continue;
                                 }
 
-                                responses.push(LogEntry {
-                                    kind: LogKind::User,
-                                    text: prompt.clone(),
-                                });
+                                responses.push(LogEntry::new(
+                                    LogKind::User,
+                                    prompt.clone(),
+                                ));
 
                                 input_buffer.clear();
                                 is_streaming = true;
@@ -1148,16 +1134,10 @@ async fn run_app(
                         if matches!(last.kind, LogKind::AgentText) {
                             last.text.push_str(&t);
                         } else {
-                            responses.push(LogEntry {
-                                kind: LogKind::AgentText,
-                                text: t,
-                            });
+                            responses.push(LogEntry::new(LogKind::AgentText, t));
                         }
                     } else {
-                        responses.push(LogEntry {
-                            kind: LogKind::AgentText,
-                            text: t,
-                        });
+                        responses.push(LogEntry::new(LogKind::AgentText, t));
                     }
                 }
                 UiEvent::AgentReasoning(r) => {
@@ -1166,16 +1146,10 @@ async fn run_app(
                         if matches!(last.kind, LogKind::AgentReasoning) {
                             last.text.push_str(&r);
                         } else {
-                            responses.push(LogEntry {
-                                kind: LogKind::AgentReasoning,
-                                text: r,
-                            });
+                            responses.push(LogEntry::new(LogKind::AgentReasoning, r));
                         }
                     } else {
-                        responses.push(LogEntry {
-                            kind: LogKind::AgentReasoning,
-                            text: r,
-                        });
+                        responses.push(LogEntry::new(LogKind::AgentReasoning, r));
                     }
                 }
                 UiEvent::AgentToolCall { name, args } => {
@@ -1185,28 +1159,22 @@ async fn run_app(
                         .as_ref()
                         .map(animated_progress_line)
                         .unwrap_or_else(|| format!("Invoking tool: {}", name));
-                    responses.push(LogEntry {
-                        kind: LogKind::ToolCall,
-                        text: format_tool_call(&name, &args),
-                    });
-
-                    // Create a pulsing loading effect on the scroll panel using tachyonfx
-                    let effect = tachyonfx::fx::repeating(
-                        tachyonfx::fx::ping_pong(
-                            tachyonfx::fx::hsl_shift_fg(
-                                [0.0, 0.15, 0.02],
-                                EffectTimer::from_ms(800, Interpolation::SineInOut),
-                            )
-                        )
-                    );
-                    loading_effect = Some(effect);
-                    last_effect_tick = Duration::from_millis(EFFECT_TICK_MS);
+                    responses.push(LogEntry::new_tool_call(format_tool_call(&name, &args)));
                 }
                 UiEvent::AgentToolResult { name, result } => {
                     active_tool_progress = None;
-                    loading_effect = None;
                     current_action = format!("Tool {} complete", name);
                     update_task_list_from_tool_result(&mut task_list, &name, &result);
+
+                    // Mark the last running ToolCall log entry as completed
+                    if let Some(last_tool_call) = responses
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| matches!(entry.kind, LogKind::ToolCall) && entry.is_running)
+                    {
+                        last_tool_call.is_running = false;
+                    }
+
                     if !matches!(
                         name.as_str(),
                         "task_write" | "task_update" | "task_complete" | "task_check"
@@ -1221,31 +1189,26 @@ async fn run_app(
                             } else {
                                 None
                             };
-                        responses.push(LogEntry {
-                            kind: LogKind::ToolResult,
-                            text: format_tool_result(&name, &result, call_args),
-                        });
+                        responses.push(LogEntry::new(
+                            LogKind::ToolResult,
+                            format_tool_result(&name, &result, call_args),
+                        ));
                     }
                 }
                 UiEvent::AgentFinished => {
                     active_tool_progress = None;
-                    loading_effect = None;
                     is_streaming = false;
                     current_action = "Idle. Waiting for prompt...".to_string();
-                    responses.push(LogEntry {
-                        kind: LogKind::Info,
-                        text: "Agent completed execution run successfully.".to_string(),
-                    });
+                    responses.push(LogEntry::new(
+                        LogKind::Info,
+                        "Agent completed execution run successfully.".to_string(),
+                    ));
                 }
                 UiEvent::AgentError(err_msg) => {
                     active_tool_progress = None;
-                    loading_effect = None;
                     is_streaming = false;
                     current_action = "Error encountered".to_string();
-                    responses.push(LogEntry {
-                        kind: LogKind::Error,
-                        text: err_msg,
-                    });
+                    responses.push(LogEntry::new(LogKind::Error, err_msg));
                 }
             }
         }
