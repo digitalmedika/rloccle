@@ -13,18 +13,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
 };
 use std::env;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RESULT_PREVIEW_LIMIT: usize = 1200;
 const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
+const TOOL_PROGRESS_WIDTH: usize = 28;
+const TOOL_PROGRESS_TICK_MS: u64 = 120;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -42,6 +45,27 @@ struct LogEntry {
     kind: LogKind,
     text: String,
 }
+
+#[derive(Clone, Debug)]
+struct ActiveToolProgress {
+    name: String,
+    started_at: Instant,
+    tick: u64,
+}
+
+impl ActiveToolProgress {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            started_at: Instant::now(),
+            tick: 0,
+        }
+    }
+    fn elapsed_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 struct TuiTask {
     id: String,
@@ -313,7 +337,49 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
     f.render_widget(list, area);
 }
 
+fn animated_progress_line(tool: &ActiveToolProgress) -> String {
+    let pos = (tool.tick as usize) % TOOL_PROGRESS_WIDTH;
+    let mut bar = String::with_capacity(TOOL_PROGRESS_WIDTH);
+    for idx in 0..TOOL_PROGRESS_WIDTH {
+        let distance = idx.abs_diff(pos);
+        bar.push(match distance {
+            0 => '█',
+            1 => '▓',
+            2 => '▒',
+            _ => '░',
+        });
+    }
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner = frames[(tool.tick as usize) % frames.len()];
+    format!(
+        "{} [{}] running {} ({}s)",
+        spinner,
+        bar,
+        tool.name,
+        tool.elapsed_secs()
+    )
+}
 
+fn render_tool_progress(f: &mut ratatui::Frame, area: Rect, tool: &ActiveToolProgress) {
+    let title = bounded_title(&format!("Tool Progress: {}", tool.name), area.width);
+    let ratio = ((tool.tick % 100) as f64) / 100.0;
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .gauge_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .label(animated_progress_line(tool))
+        .ratio(ratio);
+    f.render_widget(gauge, area);
+}
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -347,10 +413,17 @@ fn render_sessions_overlay(
         .iter()
         .enumerate()
         .map(|(idx, session)| {
-            let marker = if session == active_thread_id { "*" } else { " " };
+            let marker = if session == active_thread_id {
+                "*"
+            } else {
+                " "
+            };
             let text = format!("{} {}", marker, session);
             let style = if idx == selected_session {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else if session == active_thread_id {
                 Style::default().fg(Color::Green)
             } else {
@@ -372,7 +445,12 @@ fn render_sessions_overlay(
                 .title(" Sessions (Up/Down select, Enter load, Esc close) ")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_stateful_widget(list, popup, &mut state);
 }
 enum UiEvent {
@@ -384,6 +462,7 @@ enum UiEvent {
     AgentToolResult { name: String, result: String },
     AgentFinished,
     AgentError(String),
+    Tick,
 }
 
 #[tokio::main]
@@ -488,6 +567,18 @@ async fn run_app(
         }
     });
 
+    // Spawn UI ticker so active tool progress bars animate even when no input arrives.
+    let tx_tick = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(TOOL_PROGRESS_TICK_MS));
+        loop {
+            interval.tick().await;
+            if tx_tick.send(UiEvent::Tick).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // App state
     let mut input_buffer = String::new();
     let mut responses: Vec<LogEntry> = vec![
@@ -502,6 +593,7 @@ async fn run_app(
     let mut current_action = String::from("Idle. Waiting for prompt...");
     let mut task_list: Vec<TuiTask> = Vec::new();
     let mut last_tool_call_args: Option<(String, String)> = None;
+    let mut active_tool_progress: Option<ActiveToolProgress> = None;
 
     loop {
         // Draw the terminal
@@ -511,10 +603,15 @@ async fn run_app(
             // Layout: main content area (scroll view) + input area at the bottom
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(8),    // Content area
-                    Constraint::Length(3), // Input prompt
-                ])
+                .constraints(if active_tool_progress.is_some() {
+                    vec![
+                        Constraint::Min(8),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                    ]
+                } else {
+                    vec![Constraint::Min(8), Constraint::Length(3)]
+                })
                 .split(size);
 
             let content_chunks = Layout::default()
@@ -804,6 +901,10 @@ async fn run_app(
 
             f.render_widget(input_paragraph, chunks[1]);
 
+            if let Some(tool_progress) = &active_tool_progress {
+                render_tool_progress(f, chunks[2], tool_progress);
+            }
+
             if sessions_overlay {
                 render_sessions_overlay(f, size, &sessions, selected_session, &thread_id);
             }
@@ -812,6 +913,12 @@ async fn run_app(
         // Process incoming events
         if let Some(event) = rx.recv().await {
             match event {
+                UiEvent::Tick => {
+                    if let Some(tool_progress) = active_tool_progress.as_mut() {
+                        tool_progress.tick = tool_progress.tick.wrapping_add(1);
+                        current_action = animated_progress_line(tool_progress);
+                    }
+                }
                 UiEvent::Mouse(mouse) => match mouse.kind {
                     event::MouseEventKind::ScrollUp => {
                         auto_scroll = false;
@@ -829,7 +936,9 @@ async fn run_app(
                             KeyCode::Esc => sessions_overlay = false,
                             KeyCode::Up => selected_session = selected_session.saturating_sub(1),
                             KeyCode::Down => {
-                                if selected_session + 1 < sessions.len() { selected_session += 1; }
+                                if selected_session + 1 < sessions.len() {
+                                    selected_session += 1;
+                                }
                             }
                             KeyCode::Enter => {
                                 if let Some(selected) = sessions.get(selected_session).cloned() {
@@ -857,7 +966,8 @@ async fn run_app(
                                 let prompt = input_buffer.trim().to_string();
 
                                 if prompt == "/sessions" {
-                                    selected_session = sessions.iter().position(|s| s == &thread_id).unwrap_or(0);
+                                    selected_session =
+                                        sessions.iter().position(|s| s == &thread_id).unwrap_or(0);
                                     sessions_overlay = true;
                                     input_buffer.clear();
                                     current_action = "Browsing sessions".to_string();
@@ -868,8 +978,8 @@ async fn run_app(
                                     session_counter += 1;
                                     thread_id = format!("tui-thread-session-{}", session_counter);
                                     storage
-        .create_thread(&thread_id, Some("tui-user".to_string()))
-        .await?;
+                                        .create_thread(&thread_id, Some("tui-user".to_string()))
+                                        .await?;
                                     sessions.push(thread_id.clone());
                                     selected_session = sessions.len().saturating_sub(1);
 
@@ -1040,28 +1150,34 @@ async fn run_app(
                 }
                 UiEvent::AgentToolCall { name, args } => {
                     last_tool_call_args = Some((name.clone(), args.clone()));
-                    current_action = format!("Invoking tool: {}", name);
+                    active_tool_progress = Some(ActiveToolProgress::new(name.clone()));
+                    current_action = active_tool_progress
+                        .as_ref()
+                        .map(animated_progress_line)
+                        .unwrap_or_else(|| format!("Invoking tool: {}", name));
                     responses.push(LogEntry {
                         kind: LogKind::ToolCall,
                         text: format_tool_call(&name, &args),
                     });
                 }
                 UiEvent::AgentToolResult { name, result } => {
+                    active_tool_progress = None;
                     current_action = format!("Tool {} complete", name);
                     update_task_list_from_tool_result(&mut task_list, &name, &result);
                     if !matches!(
                         name.as_str(),
                         "task_write" | "task_update" | "task_complete" | "task_check"
                     ) {
-                        let call_args = if let Some((ref last_name, ref last_args)) = last_tool_call_args {
-                            if last_name == &name {
-                                Some(last_args.as_str())
+                        let call_args =
+                            if let Some((ref last_name, ref last_args)) = last_tool_call_args {
+                                if last_name == &name {
+                                    Some(last_args.as_str())
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
-                            }
-                        } else {
-                            None
-                        };
+                            };
                         responses.push(LogEntry {
                             kind: LogKind::ToolResult,
                             text: format_tool_result(&name, &result, call_args),
@@ -1069,6 +1185,7 @@ async fn run_app(
                     }
                 }
                 UiEvent::AgentFinished => {
+                    active_tool_progress = None;
                     is_streaming = false;
                     current_action = "Idle. Waiting for prompt...".to_string();
                     responses.push(LogEntry {
@@ -1077,6 +1194,7 @@ async fn run_app(
                     });
                 }
                 UiEvent::AgentError(err_msg) => {
+                    active_tool_progress = None;
                     is_streaming = false;
                     current_action = "Error encountered".to_string();
                     responses.push(LogEntry {
@@ -1371,7 +1489,11 @@ fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>)
                 let char_count = content.chars().count();
                 let path_str = call_args_str
                     .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                    .and_then(|v| {
+                        v.get("path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .unwrap_or_else(|| "Unknown".to_string());
 
                 format!(
@@ -1571,11 +1693,3 @@ fn compute_diff(path: &str, new_content: &str) -> String {
         diff_output
     }
 }
-
-
-
-
-
-
-
-
