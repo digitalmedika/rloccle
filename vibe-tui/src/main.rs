@@ -1,4 +1,4 @@
-use crossterm::{
+﻿use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -19,6 +19,7 @@ use std::env;
 use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -51,6 +52,45 @@ struct TasksPayload {
     task: Option<TuiTask>,
 }
 
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let target_width = max_width - 3;
+    let mut output = String::new();
+    let mut width = 0;
+
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > target_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+
+    output.push_str("...");
+    output
+}
+
+fn bounded_title(title: &str, area_width: u16) -> String {
+    let max_width = area_width.saturating_sub(2) as usize;
+    if max_width <= 2 {
+        return truncate_to_width(title, max_width);
+    }
+
+    format!(" {} ", truncate_to_width(title, max_width - 2))
+}
+
 fn update_task_list_from_tool_result(tasks: &mut Vec<TuiTask>, tool_name: &str, result: &str) {
     if !matches!(
         tool_name,
@@ -74,39 +114,17 @@ fn update_task_list_from_tool_result(tasks: &mut Vec<TuiTask>, tool_name: &str, 
     }
 }
 
-fn task_status_style(status: &str) -> (Span<'static>, Style) {
+fn task_status_style(status: &str) -> (&'static str, Style) {
     match status.to_ascii_lowercase().as_str() {
-        "completed" | "done" => (
-            Span::styled(
-                "?",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Style::default().fg(Color::Green),
-        ),
+        "completed" | "done" => ("x", Style::default().fg(Color::Green)),
         "in_progress" | "running" | "active" => (
-            Span::styled(
-                "?",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            ">",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        "failed" | "error" => (
-            Span::styled(
-                "!",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Style::default().fg(Color::Red),
-        ),
-        _ => (
-            Span::styled("?", Style::default().fg(Color::DarkGray)),
-            Style::default().fg(Color::Gray),
-        ),
+        "failed" | "error" => ("!", Style::default().fg(Color::Red)),
+        _ => ("-", Style::default().fg(Color::Gray)),
     }
 }
 
@@ -118,21 +136,31 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
                 || task.status.eq_ignore_ascii_case("done")
         })
         .count();
-    let title = format!(" Task List ({}/{}) ", completed, tasks.len());
+    let title = bounded_title(
+        &format!("Task List ({}/{})", completed, tasks.len()),
+        area.width,
+    );
 
     if tasks.is_empty() {
-        let empty = Paragraph::new("No task list yet. Agent will call task_write first.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
+        let empty = Paragraph::new(
+            wrap_text(
+                "No task list yet. Agent will call task_write first.",
+                area.width.saturating_sub(2) as usize,
+            )
+            .join("\n"),
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         f.render_widget(empty, area);
         return;
     }
 
+    let task_width = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = tasks
         .iter()
         .map(|task| {
@@ -144,15 +172,30 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
             } else {
                 task.content.as_str()
             };
-            ListItem::new(Line::from(vec![
-                icon,
-                Span::raw(" "),
-                Span::styled(
-                    format!("{} ", task.id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(display_text.to_string(), style),
-            ]))
+            let prefix = truncate_to_width(
+                &format!("{} {} ", icon, task.id),
+                task_width.saturating_sub(1).max(1),
+            );
+            let prefix_width = display_width(&prefix);
+            let text_width = task_width.saturating_sub(prefix_width).max(1);
+            let wrapped = wrap_text(display_text, text_width);
+            let mut lines = Vec::new();
+
+            for (idx, part) in wrapped.into_iter().enumerate() {
+                if idx == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(part, style),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(prefix_width)),
+                        Span::styled(part, style),
+                    ]));
+                }
+            }
+
+            ListItem::new(lines)
         })
         .collect();
 
@@ -321,9 +364,9 @@ async fn run_app(
             for entry in &responses {
                 match entry.kind {
                     LogKind::User => {
-                        let prefix_text = "👤 User: ";
-                        let prefix_width = 9;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "User: ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -348,9 +391,9 @@ async fn run_app(
                         }
                     }
                     LogKind::AgentText => {
-                        let prefix_text = "🤖 Agent: ";
-                        let prefix_width = 10;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "Agent: ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -375,9 +418,9 @@ async fn run_app(
                         }
                     }
                     LogKind::AgentReasoning => {
-                        let prefix_text = "🧠 [Thinking] ";
-                        let prefix_width = 14;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "[Thinking] ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -402,9 +445,9 @@ async fn run_app(
                         }
                     }
                     LogKind::ToolCall => {
-                        let prefix_text = "🔧 [Tool Call] ";
-                        let prefix_width = 15;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "[Tool Call] ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -439,9 +482,9 @@ async fn run_app(
                         }
                     }
                     LogKind::ToolResult => {
-                        let prefix_text = "✅ [Tool Result] ";
-                        let prefix_width = 17;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "[Tool Result] ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -476,9 +519,9 @@ async fn run_app(
                         }
                     }
                     LogKind::Error => {
-                        let prefix_text = "❌ [Error] ";
-                        let prefix_width = 11;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "[Error] ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -503,9 +546,9 @@ async fn run_app(
                         }
                     }
                     LogKind::Info => {
-                        let prefix_text = "ℹ️ [Info] ";
-                        let prefix_width = 10;
-                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(20);
+                        let prefix_text = "[Info] ";
+                        let prefix_width = display_width(prefix_text);
+                        let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
                         let mut first = true;
@@ -545,14 +588,18 @@ async fn run_app(
             }
 
             let text = ratatui::text::Text::from(lines);
+            let scroll_title = bounded_title(
+                &format!(
+                    "Streaming Response Logs & Task Signal Lane | Action: {}",
+                    current_action
+                ),
+                content_chunks[0].width,
+            );
             let scroll_view = Paragraph::new(text)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(
-                            " Streaming Response Logs & Task Signal Lane | Action: {} ",
-                            current_action
-                        ))
+                        .title(scroll_title)
                         .border_style(Style::default().fg(if is_streaming {
                             Color::Yellow
                         } else {
@@ -806,32 +853,105 @@ async fn run_app(
 }
 
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
     let mut lines = Vec::new();
+
     for line in text.split('\n') {
         if line.is_empty() {
             lines.push(String::new());
             continue;
         }
+
         let mut current_line = String::new();
-        let words: Vec<&str> = line.split(' ').collect();
-        let mut is_first = true;
-        for word in words {
-            if is_first {
-                current_line.push_str(word);
-                is_first = false;
-            } else {
-                if current_line.len() + 1 + word.len() <= max_width {
-                    current_line.push(' ');
-                    current_line.push_str(word);
-                } else {
+        let mut current_width = 0;
+
+        for word in line.split_whitespace() {
+            let word_width = display_width(word);
+
+            if word_width > max_width {
+                if !current_line.is_empty() {
                     lines.push(current_line);
-                    current_line = word.to_string();
+                    current_line = String::new();
+                    current_width = 0;
                 }
+
+                lines.extend(split_word_to_width(word, max_width));
+                continue;
+            }
+
+            if current_line.is_empty() {
+                current_line.push_str(word);
+                current_width = word_width;
+            } else if current_width + 1 + word_width <= max_width {
+                current_line.push(' ');
+                current_line.push_str(word);
+                current_width += 1 + word_width;
+            } else {
+                lines.push(current_line);
+                current_line = word.to_string();
+                current_width = word_width;
             }
         }
-        lines.push(current_line);
+
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
     }
+
     lines
+}
+
+fn split_word_to_width(word: &str, max_width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for ch in word.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if !current.is_empty() && current_width + ch_width > max_width {
+            chunks.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width += ch_width;
+
+        if current_width >= max_width {
+            chunks.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_text_breaks_long_tokens_to_fit_width() {
+        assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrap_text_uses_display_width_for_unicode() {
+        let wrapped = wrap_text("Ã°Å¸Â¤â€“Ã°Å¸Â¤â€“Ã°Å¸Â¤â€“ done", 4);
+        assert!(wrapped.iter().all(|line| display_width(line) <= 4));
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_result_within_limit() {
+        let truncated = truncate_to_width("Streaming Response Logs", 12);
+        assert!(display_width(&truncated) <= 12);
+        assert!(truncated.ends_with("..."));
+    }
 }
 
 fn format_tool_call(name: &str, args_str: &str) -> String {
@@ -908,9 +1028,10 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                         let content = t.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
                         let status_icon = match status {
-                            "completed" => "?",
-                            "in_progress" => "??",
-                            _ => "?",
+                            "completed" => "[x]",
+                            "in_progress" => "[>]",
+                            "failed" | "error" => "[!]",
+                            _ => "[-]",
                         };
                         lines.push(format!(
                             "  {} #{} {} [{}]",
