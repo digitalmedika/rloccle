@@ -26,9 +26,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const RESULT_PREVIEW_LIMIT: usize = 1200;
 const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
+const GREP_PREVIEW_LIMIT: usize = 5;
 const TOOL_PROGRESS_WIDTH: usize = 28;
 const TOOL_PROGRESS_TICK_MS: u64 = 120;
-const READ_PREVIEW_MAX_LINES: usize = 120;
+const READ_PREVIEW_MAX_LINES: usize = 10;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -46,8 +47,10 @@ struct LogEntry {
     kind: LogKind,
     text: String,
     is_running: bool,
+    tool_name: Option<String>,
     read_preview: Option<ReadPreview>,
     grep_preview: Option<GrepPreview>,
+    replace_preview: Option<ReplacePreview>,
 }
 
 impl LogEntry {
@@ -56,18 +59,22 @@ impl LogEntry {
             kind,
             text,
             is_running: false,
+            tool_name: None,
             read_preview: None,
             grep_preview: None,
+            replace_preview: None,
         }
     }
 
-    fn new_tool_call(text: String) -> Self {
+    fn new_tool_call(name: String, text: String) -> Self {
         Self {
             kind: LogKind::ToolCall,
             text,
             is_running: true,
+            tool_name: Some(name),
             read_preview: None,
             grep_preview: None,
+            replace_preview: None,
         }
     }
 
@@ -76,8 +83,10 @@ impl LogEntry {
             kind: LogKind::ToolResult,
             text: preview.to_plain_text(),
             is_running: false,
+            tool_name: None,
             read_preview: Some(preview),
             grep_preview: None,
+            replace_preview: None,
         }
     }
 
@@ -86,8 +95,22 @@ impl LogEntry {
             kind: LogKind::ToolResult,
             text: preview.to_plain_text(),
             is_running: false,
+            tool_name: None,
             read_preview: None,
             grep_preview: Some(preview),
+            replace_preview: None,
+        }
+    }
+
+    fn new_replace_preview(preview: ReplacePreview) -> Self {
+        Self {
+            kind: LogKind::ToolResult,
+            text: preview.to_plain_text(),
+            is_running: false,
+            tool_name: None,
+            read_preview: None,
+            grep_preview: None,
+            replace_preview: Some(preview),
         }
     }
 }
@@ -216,6 +239,42 @@ impl GrepPreview {
             lines.push(format!("... ({} matches hidden)", self.hidden_matches));
         }
 
+        lines.join("\n")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReplacePreview {
+    path: String,
+    old: String,
+    new: String,
+    expected_replacements: Option<usize>,
+    replacements: usize,
+    success: bool,
+}
+
+impl ReplacePreview {
+    fn display_path(&self) -> String {
+        self.path.replace('\\', "/")
+    }
+
+    fn to_plain_text(&self) -> String {
+        let mut lines = vec![format!(
+            "replace_in_file {} ({})",
+            self.display_path(),
+            if self.success { "success" } else { "failed" }
+        )];
+        lines.push(format!("replacements: {}", self.replacements));
+        if let Some(expected) = self.expected_replacements {
+            lines.push(format!("expected: {}", expected));
+        }
+        lines.push("diff:".to_string());
+        for line in self.old.lines().take(8) {
+            lines.push(format!("- {}", line));
+        }
+        for line in self.new.lines().take(8) {
+            lines.push(format!("+ {}", line));
+        }
         lines.join("\n")
     }
 }
@@ -410,21 +469,30 @@ fn update_task_list_from_tool_result(tasks: &mut Vec<TuiTask>, tool_name: &str, 
     }
 }
 
-fn task_status_style(status: &str) -> (&'static str, Style) {
+fn task_status_style(status: &str, tick: u64) -> (&'static str, Style) {
     match status.to_ascii_lowercase().as_str() {
         "completed" | "done" => ("x", Style::default().fg(Color::Green)),
-        "in_progress" | "running" | "active" => (
-            ">",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        "in_progress" | "running" | "active" => {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            (
+                frames[(tick as usize) % frames.len()],
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }
         "failed" | "error" => ("!", Style::default().fg(Color::Red)),
         _ => ("-", Style::default().fg(Color::Gray)),
     }
 }
 
-fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_streaming: bool) {
+fn render_task_panel(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    tasks: &[TuiTask],
+    is_streaming: bool,
+    animation_tick: u64,
+) {
     let completed = tasks
         .iter()
         .filter(|task| {
@@ -460,10 +528,11 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
     let items: Vec<ListItem> = tasks
         .iter()
         .map(|task| {
-            let (icon, style) = task_status_style(&task.status);
-            let display_text = if task.status.eq_ignore_ascii_case("in_progress")
-                || task.status.eq_ignore_ascii_case("active")
-            {
+            let is_active_task = task.status.eq_ignore_ascii_case("in_progress")
+                || task.status.eq_ignore_ascii_case("running")
+                || task.status.eq_ignore_ascii_case("active");
+            let (icon, style) = task_status_style(&task.status, animation_tick);
+            let display_text = if is_active_task {
                 task.active_form.as_str()
             } else {
                 task.content.as_str()
@@ -649,6 +718,83 @@ fn push_grep_preview_lines(
             panel_style,
         );
     }
+}
+
+fn push_replace_preview_lines(lines: &mut Vec<Line<'static>>, preview: &ReplacePreview) {
+    let status_style = if preview.success {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("✓ ", status_style),
+        Span::styled(
+            "replace_in_file",
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(preview.display_path(), Style::default().fg(Color::Gray)),
+    ]));
+
+    let expected = preview
+        .expected_replacements
+        .map(|count| format!(", expected={}", count))
+        .unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("replacements={}{}", preview.replacements, expected),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("diff", Style::default().fg(Color::Cyan)),
+    ]));
+
+    for line in preview.old.lines().take(12) {
+        push_replace_diff_line(lines, "-", line, Color::Red, &preview.path);
+    }
+    if preview.old.lines().count() > 12 {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("... old text truncated", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    for line in preview.new.lines().take(12) {
+        push_replace_diff_line(lines, "+", line, Color::Green, &preview.path);
+    }
+    if preview.new.lines().count() > 12 {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("... new text truncated", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+}
+
+fn push_replace_diff_line(
+    lines: &mut Vec<Line<'static>>,
+    marker: &str,
+    content: &str,
+    color: Color,
+    path: &str,
+) {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{} ", marker),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(highlight_code_line(path, content));
+    lines.push(Line::from(spans));
 }
 
 fn push_grep_panel_plain_line(
@@ -1211,6 +1357,7 @@ async fn run_app(
     let mut task_list: Vec<TuiTask> = Vec::new();
     let mut last_tool_call_args: Option<(String, String)> = None;
     let mut active_tool_progress: Option<ActiveToolProgress> = None;
+    let mut task_animation_tick: u64 = 0;
 
     loop {
         // Draw the terminal
@@ -1221,7 +1368,9 @@ async fn run_app(
             let input_line_count = wrap_text(&input_buffer, input_inner_width)
                 .len()
                 .max(1) as u16;
-            let input_height = input_line_count.saturating_add(2).min(size.height.saturating_sub(8).max(3));
+            let input_height = input_line_count
+                .saturating_add(1)
+                .min(size.height.saturating_sub(8).max(2));
 
             // Layout: main content area (scroll view) + input area at the bottom
             let chunks = Layout::default()
@@ -1323,20 +1472,49 @@ async fn run_app(
                     }
                     LogKind::ToolCall => {
                         let is_running = entry.is_running;
+                        let tool_tick = active_tool_progress
+                            .as_ref()
+                            .filter(|p| {
+                                entry
+                                    .tool_name
+                                    .as_deref()
+                                    .map(|name| name == p.name)
+                                    .unwrap_or(true)
+                            })
+                            .map(|p| p.tick)
+                            .unwrap_or(0);
                         let prefix_text = if is_running {
                             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                            let spinner = active_tool_progress
-                                .as_ref()
-                                .map(|p| frames[(p.tick as usize) % frames.len()])
-                                .unwrap_or("⠋");
-                            format!("{} ", spinner)
+                            let spinner = frames[(tool_tick as usize) % frames.len()];
+                            format!("{} Loading ", spinner)
                         } else {
-                            "✓ ".to_string()
+                            "✓ Done ".to_string()
                         };
                         let prefix_width = display_width(&prefix_text);
                         let wrap_width = scroll_view_width.saturating_sub(prefix_width).max(1);
                         let wrapped = wrap_text(&entry.text, wrap_width);
 
+                        if is_running {
+                            let status = entry
+                                .tool_name
+                                .as_deref()
+                                .map(|name| format!("Tool `{}` is running...", name))
+                                .unwrap_or_else(|| "Tool is running...".to_string());
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    prefix_text.clone(),
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    status,
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                        }
                         let mut first = true;
                         for part in wrapped {
                             let line_style = if part.starts_with('+') {
@@ -1380,6 +1558,11 @@ async fn run_app(
                         }
                         if let Some(preview) = &entry.grep_preview {
                             push_grep_preview_lines(&mut lines, preview, scroll_view_width);
+                            lines.push(Line::from(""));
+                            continue;
+                        }
+                        if let Some(preview) = &entry.replace_preview {
+                            push_replace_preview_lines(&mut lines, preview);
                             lines.push(Line::from(""));
                             continue;
                         }
@@ -1511,7 +1694,13 @@ async fn run_app(
                 .scroll((scroll_offset, 0));
 
             f.render_widget(scroll_view, content_chunks[0]);
-            render_task_panel(f, content_chunks[1], &task_list, is_streaming);
+            render_task_panel(
+                f,
+                content_chunks[1],
+                &task_list,
+                is_streaming,
+                task_animation_tick,
+            );
 
 
 
@@ -1522,27 +1711,40 @@ async fn run_app(
                 Style::default().fg(Color::White)
             };
 
-            let input_title = if is_streaming {
-                " Prompt Input (Locked - Agent is working...) "
+            let prompt_prefix = "> ";
+            let input_hint = "ketik prompt di sini...";
+            let mut input_spans = vec![Span::styled(prompt_prefix, input_style)];
+            if input_buffer.is_empty() && !is_streaming {
+                input_spans.push(Span::styled(
+                    input_hint,
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ));
             } else {
-                " Prompt Input (Enter to Send, /new, /sessions, Esc to Quit) "
-            };
+                input_spans.push(Span::styled(input_buffer.as_str(), input_style));
+            }
 
-            let input_paragraph = Paragraph::new(input_buffer.as_str())
+            let input_text = ratatui::text::Text::from(vec![
+                Line::from(input_spans),
+                Line::from(vec![
+                    Span::styled("esc to quit", Style::default().fg(Color::Gray)),
+                ]),
+            ]);
+
+            let input_paragraph = Paragraph::new(input_text)
                 .style(input_style)
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(input_title)
-                        .border_style(Style::default().fg(if is_streaming {
-                            Color::DarkGray
-                        } else {
-                            Color::Blue
-                        })),
-                );
+                .wrap(Wrap { trim: false });
 
             f.render_widget(input_paragraph, chunks[1]);
+
+            if !is_streaming && !sessions_overlay {
+                let (cursor_x, cursor_y) = input_cursor_position(
+                    chunks[1],
+                    prompt_prefix,
+                    &input_buffer,
+                    input_inner_width,
+                );
+                f.set_cursor(cursor_x, cursor_y);
+            }
 
 
 
@@ -1555,6 +1757,7 @@ async fn run_app(
         if let Some(event) = rx.recv().await {
             match event {
                 UiEvent::Tick => {
+                    task_animation_tick = task_animation_tick.wrapping_add(1);
                     if let Some(tool_progress) = active_tool_progress.as_mut() {
                         tool_progress.tick = tool_progress.tick.wrapping_add(1);
                         current_action = animated_progress_line(tool_progress);
@@ -1785,7 +1988,7 @@ async fn run_app(
                         .as_ref()
                         .map(animated_progress_line)
                         .unwrap_or_else(|| format!("Invoking tool: {}", name));
-                    responses.push(LogEntry::new_tool_call(format_tool_call(&name, &args)));
+                    responses.push(LogEntry::new_tool_call(name.clone(), format_tool_call(&name, &args)));
                 }
                 UiEvent::AgentToolResult { name, result } => {
                     active_tool_progress = None;
@@ -1837,6 +2040,19 @@ async fn run_app(
                                     format_tool_result(&name, &result, call_args),
                                 ));
                             }
+                        } else if name == "replace_in_file" {
+                            if let Some(preview) = build_replace_preview(&result_map, call_args) {
+                                if let Some(idx) = completed_tool_index {
+                                    responses[idx] = LogEntry::new_replace_preview(preview);
+                                } else {
+                                    responses.push(LogEntry::new_replace_preview(preview));
+                                }
+                            } else {
+                                responses.push(LogEntry::new(
+                                    LogKind::ToolResult,
+                                    format_tool_result(&name, &result, call_args),
+                                ));
+                            }
                         } else {
                             responses.push(LogEntry::new(
                                 LogKind::ToolResult,
@@ -1865,6 +2081,33 @@ async fn run_app(
     }
 
     Ok(())
+}
+
+fn input_cursor_position(
+    area: Rect,
+    prompt_prefix: &str,
+    input: &str,
+    input_inner_width: usize,
+) -> (u16, u16) {
+    let prompt_width = display_width(prompt_prefix);
+    let mut visual_x = prompt_width;
+    let mut visual_y = 0usize;
+    let max_width = input_inner_width.max(1);
+
+    for ch in input.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if visual_x + ch_width > max_width {
+            visual_y += 1;
+            visual_x = 0;
+        }
+        visual_x += ch_width;
+    }
+
+    let max_y = area.height.saturating_sub(1) as usize;
+    (
+        area.x.saturating_add(visual_x as u16),
+        area.y.saturating_add(visual_y.min(max_y) as u16),
+    )
 }
 
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
@@ -2013,6 +2256,23 @@ mod tests {
     }
 
     #[test]
+    fn read_file_preview_limits_display_to_ten_lines() {
+        let content = (1..=12)
+            .map(|idx| format!("line {}", idx))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let result = format_tool_result(
+            "read_file",
+            &format!(r#"{{"content":"{}"}}"#, content),
+            Some(r#"{"path":"D:\\project\\rloccle\\src\\main.rs"}"#),
+        );
+
+        assert!(result.contains(" 10    line 10"));
+        assert!(!result.contains(" 11    line 11"));
+        assert!(result.contains("2 lines hidden"));
+    }
+
+    #[test]
     fn grep_result_renders_match_preview_without_json() {
         let result = format_tool_result(
             "grep",
@@ -2027,6 +2287,46 @@ mod tests {
         assert!(result.contains("D:/project/rloccle/vibe-tui/src/main.rs:"));
         assert!(result.contains("Line 555, Char 1"));
         assert!(!result.contains("\"matches\""));
+    }
+
+    #[test]
+    fn grep_result_limits_display_to_five_matches() {
+        let matches = (1..=7)
+            .map(|idx| {
+                format!(
+                    r#"{{"file":"D:\\project\\rloccle\\vibe-tui\\src\\main.rs","line":{},"content":"is_running value {}"}}"#,
+                    idx, idx
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let result = format_tool_result(
+            "grep",
+            &format!(r#"{{"matches":[{}]}}"#, matches),
+            Some(r#"{"query":"is_running","path":"D:\\project\\rloccle\\vibe-tui\\src\\main.rs"}"#),
+        );
+
+        assert!(result.contains("Line 5, Char 1"));
+        assert!(!result.contains("Line 6, Char 1"));
+        assert!(result.contains("2 matches hidden"));
+    }
+
+    #[test]
+    fn replace_in_file_result_renders_diff_preview_without_json() {
+        let result = format_tool_result(
+            "replace_in_file",
+            r#"{"success":true,"replacements":1}"#,
+            Some(r#"{"path":"D:\\project\\rloccle\\vibe-tui\\src\\main.rs","old":"let a = 1;","new":"let a = 2;","expected_replacements":1}"#),
+        );
+
+        assert!(result.starts_with(
+            "replace_in_file D:/project/rloccle/vibe-tui/src/main.rs (success)"
+        ));
+        assert!(result.contains("replacements: 1"));
+        assert!(result.contains("expected: 1"));
+        assert!(result.contains("- let a = 1;"));
+        assert!(result.contains("+ let a = 2;"));
+        assert!(!result.contains("\"success\""));
     }
 }
 
@@ -2070,6 +2370,15 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
             "delete" => {
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 format!("Delete path: {}", path)
+            }
+            "replace_in_file" => {
+                let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let expected = map
+                    .get("expected_replacements")
+                    .and_then(|v| v.as_u64())
+                    .map(|count| format!(", expected={}", count))
+                    .unwrap_or_default();
+                format!("replace_in_file {}{}", path.replace('\\', "/"), expected)
             }
             "read_file" => {
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -2192,7 +2501,7 @@ fn build_grep_preview(
     let raw_matches = map.get("matches").and_then(|v| v.as_array())?;
     let shown_matches = raw_matches
         .iter()
-        .take(RESULT_LIST_LIMIT)
+        .take(GREP_PREVIEW_LIMIT)
         .filter_map(|item| {
             let file = item.get("file")?.as_str()?.to_string();
             let line = item.get("line")?.as_u64()? as usize;
@@ -2214,6 +2523,34 @@ fn build_grep_preview(
         path,
         hidden_matches: raw_matches.len().saturating_sub(shown_matches.len()),
         matches: shown_matches,
+    })
+}
+
+fn build_replace_preview(
+    map: &serde_json::Map<String, serde_json::Value>,
+    call_args_str: Option<&str>,
+) -> Option<ReplacePreview> {
+    let args_value = call_args_str.and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())?;
+    let path = args_value.get("path")?.as_str()?.to_string();
+    let old = args_value.get("old")?.as_str()?.to_string();
+    let new = args_value.get("new")?.as_str()?.to_string();
+    let expected_replacements = args_value
+        .get("expected_replacements")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let replacements = map.get("replacements").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let success = map
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    Some(ReplacePreview {
+        path,
+        old,
+        new,
+        expected_replacements,
+        replacements,
+        success,
     })
 }
 
@@ -2296,6 +2633,11 @@ fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>)
                 } else {
                     "File write finished with unknown status".to_string()
                 }
+            }
+            "replace_in_file" => {
+                build_replace_preview(&map, call_args_str)
+                    .map(|preview| preview.to_plain_text())
+                    .unwrap_or_else(|| format_tool_fields(name, &map))
             }
             "delete" => {
                 if map
