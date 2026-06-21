@@ -2,15 +2,18 @@ pub mod fs;
 pub mod system;
 pub mod task;
 
-use std::sync::Arc;
 use crate::tool::Tool;
+use std::sync::Arc;
 
-/// Returns all built-in filesystem tools (read_file, write_file, list_dir, grep, glob, delete, file_stat, mkdir)
-/// as a Vector of Arc<dyn Tool>.
+/// Returns all built-in filesystem tools (read_file, read_file_range, write_file, replace_in_file,
+/// replace_lines, list_dir, grep, glob, delete, file_stat, mkdir) as a Vector of Arc<dyn Tool>.
 pub fn all_fs_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(fs::read_file_tool()),
+        Arc::new(fs::read_file_range_tool()),
         Arc::new(fs::write_file_tool()),
+        Arc::new(fs::replace_in_file_tool()),
+        Arc::new(fs::replace_lines_tool()),
         Arc::new(fs::list_dir_tool()),
         Arc::new(fs::grep_tool()),
         Arc::new(fs::glob_tool()),

@@ -15,6 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
 };
+use tachyonfx::{Effect, EffectRenderer, EffectTimer, Interpolation};
 use std::env;
 use std::io;
 use std::path::Path;
@@ -28,6 +29,7 @@ const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
 const TOOL_PROGRESS_WIDTH: usize = 28;
 const TOOL_PROGRESS_TICK_MS: u64 = 120;
+const EFFECT_TICK_MS: u64 = 50;
 
 #[derive(Clone, Debug)]
 enum LogKind {
@@ -463,6 +465,7 @@ enum UiEvent {
     AgentFinished,
     AgentError(String),
     Tick,
+    EffectTick,
 }
 
 #[tokio::main]
@@ -579,6 +582,18 @@ async fn run_app(
         }
     });
 
+    // Spawn effect ticker for tachyonfx loading indicator animations
+    let tx_effect = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(EFFECT_TICK_MS));
+        loop {
+            interval.tick().await;
+            if tx_effect.send(UiEvent::EffectTick).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // App state
     let mut input_buffer = String::new();
     let mut responses: Vec<LogEntry> = vec![
@@ -594,6 +609,10 @@ async fn run_app(
     let mut task_list: Vec<TuiTask> = Vec::new();
     let mut last_tool_call_args: Option<(String, String)> = None;
     let mut active_tool_progress: Option<ActiveToolProgress> = None;
+
+    // Tachyonfx loading effect state
+    let mut loading_effect: Option<Effect> = None;
+    let mut last_effect_tick = Duration::ZERO;
 
     loop {
         // Draw the terminal
@@ -873,6 +892,12 @@ async fn run_app(
             f.render_widget(scroll_view, content_chunks[0]);
             render_task_panel(f, content_chunks[1], &task_list, is_streaming);
 
+            // Render tachyonfx loading effect on the scroll panel when tool is active
+            if let Some(ref mut effect) = loading_effect {
+                let scroll_area = content_chunks[0];
+                f.render_effect(effect, scroll_area, last_effect_tick);
+            }
+
             // 2. Render input prompt
             let input_style = if is_streaming {
                 Style::default().fg(Color::DarkGray)
@@ -917,6 +942,11 @@ async fn run_app(
                     if let Some(tool_progress) = active_tool_progress.as_mut() {
                         tool_progress.tick = tool_progress.tick.wrapping_add(1);
                         current_action = animated_progress_line(tool_progress);
+                    }
+                }
+                UiEvent::EffectTick => {
+                    if loading_effect.is_some() {
+                        last_effect_tick += Duration::from_millis(EFFECT_TICK_MS);
                     }
                 }
                 UiEvent::Mouse(mouse) => match mouse.kind {
@@ -1159,9 +1189,22 @@ async fn run_app(
                         kind: LogKind::ToolCall,
                         text: format_tool_call(&name, &args),
                     });
+
+                    // Create a pulsing loading effect on the scroll panel using tachyonfx
+                    let effect = tachyonfx::fx::repeating(
+                        tachyonfx::fx::ping_pong(
+                            tachyonfx::fx::hsl_shift_fg(
+                                [0.0, 0.15, 0.02],
+                                EffectTimer::from_ms(800, Interpolation::SineInOut),
+                            )
+                        )
+                    );
+                    loading_effect = Some(effect);
+                    last_effect_tick = Duration::from_millis(EFFECT_TICK_MS);
                 }
                 UiEvent::AgentToolResult { name, result } => {
                     active_tool_progress = None;
+                    loading_effect = None;
                     current_action = format!("Tool {} complete", name);
                     update_task_list_from_tool_result(&mut task_list, &name, &result);
                     if !matches!(
@@ -1186,6 +1229,7 @@ async fn run_app(
                 }
                 UiEvent::AgentFinished => {
                     active_tool_progress = None;
+                    loading_effect = None;
                     is_streaming = false;
                     current_action = "Idle. Waiting for prompt...".to_string();
                     responses.push(LogEntry {
@@ -1195,6 +1239,7 @@ async fn run_app(
                 }
                 UiEvent::AgentError(err_msg) => {
                     active_tool_progress = None;
+                    loading_effect = None;
                     is_streaming = false;
                     current_action = "Error encountered".to_string();
                     responses.push(LogEntry {
