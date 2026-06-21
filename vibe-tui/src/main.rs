@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::env;
 use std::io;
@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RESULT_PREVIEW_LIMIT: usize = 1200;
+const CMD_RESULT_PREVIEW_LIMIT: usize = 400;
 const RESULT_LIST_LIMIT: usize = 12;
 
 #[derive(Clone, Debug)]
@@ -312,6 +313,68 @@ fn render_task_panel(f: &mut ratatui::Frame, area: Rect, tasks: &[TuiTask], is_s
     f.render_widget(list, area);
 }
 
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn render_sessions_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    sessions: &[String],
+    selected_session: usize,
+    active_thread_id: &str,
+) {
+    let popup = centered_rect(62, 60, area);
+    f.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, session)| {
+            let marker = if session == active_thread_id { "*" } else { " " };
+            let text = format!("{} {}", marker, session);
+            let style = if idx == selected_session {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if session == active_thread_id {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(text, style)))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if !sessions.is_empty() {
+        state.select(Some(selected_session.min(sessions.len() - 1)));
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Sessions (Up/Down select, Enter load, Esc close) ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD));
+    f.render_stateful_widget(list, popup, &mut state);
+}
 enum UiEvent {
     Input(KeyEvent),
     Mouse(crossterm::event::MouseEvent),
@@ -393,9 +456,13 @@ async fn run_app(
         signal: TaskSignalProvider::new(),
     });
 
-    let thread_id = "tui-thread-session";
+    let mut session_counter: u64 = 1;
+    let mut thread_id = format!("tui-thread-session-{}", session_counter);
+    let mut sessions: Vec<String> = vec![thread_id.clone()];
+    let mut sessions_overlay = false;
+    let mut selected_session: usize = 0;
     storage
-        .create_thread(thread_id, Some("tui-user".to_string()))
+        .create_thread(&thread_id, Some("tui-user".to_string()))
         .await?;
 
     // Create channel for events
@@ -426,7 +493,7 @@ async fn run_app(
     let mut responses: Vec<LogEntry> = vec![
         LogEntry {
             kind: LogKind::Info,
-            text: "Welcome to Vibe-TUI Agent Checklist! Enter your request below to plan and execute coding tasks.".to_string(),
+            text: "Welcome to Vibe-TUI Agent Checklist! Enter your request below to plan and execute coding tasks. Type /new to start a fresh session, /sessions to browse sessions.".to_string(),
         }
     ];
     let mut scroll_offset: u16 = 0;
@@ -434,6 +501,7 @@ async fn run_app(
     let mut is_streaming = false;
     let mut current_action = String::from("Idle. Waiting for prompt...");
     let mut task_list: Vec<TuiTask> = Vec::new();
+    let mut last_tool_call_args: Option<(String, String)> = None;
 
     loop {
         // Draw the terminal
@@ -718,7 +786,7 @@ async fn run_app(
             let input_title = if is_streaming {
                 " Prompt Input (Locked - Agent is working...) "
             } else {
-                " Prompt Input (Press Enter to Send, Esc to Quit) "
+                " Prompt Input (Enter to Send, /new, /sessions, Esc to Quit) "
             };
 
             let input_paragraph = Paragraph::new(input_buffer.as_str())
@@ -735,6 +803,10 @@ async fn run_app(
                 );
 
             f.render_widget(input_paragraph, chunks[1]);
+
+            if sessions_overlay {
+                render_sessions_overlay(f, size, &sessions, selected_session, &thread_id);
+            }
         })?;
 
         // Process incoming events
@@ -752,13 +824,71 @@ async fn run_app(
                     _ => {}
                 },
                 UiEvent::Input(key) => {
+                    if sessions_overlay {
+                        match key.code {
+                            KeyCode::Esc => sessions_overlay = false,
+                            KeyCode::Up => selected_session = selected_session.saturating_sub(1),
+                            KeyCode::Down => {
+                                if selected_session + 1 < sessions.len() { selected_session += 1; }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(selected) = sessions.get(selected_session).cloned() {
+                                    thread_id = selected.clone();
+                                    input_buffer.clear();
+                                    responses.clear();
+                                    task_list.clear();
+                                    scroll_offset = 0;
+                                    auto_scroll = true;
+                                    current_action = format!("Loaded session {}", thread_id);
+                                    responses.push(LogEntry { kind: LogKind::Info, text: format!("Loaded session {}. New prompts will continue this conversation context.", thread_id) });
+                                }
+                                sessions_overlay = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Esc => {
                             break;
                         }
                         KeyCode::Enter => {
                             if !is_streaming && !input_buffer.trim().is_empty() {
-                                let prompt = input_buffer.clone();
+                                let prompt = input_buffer.trim().to_string();
+
+                                if prompt == "/sessions" {
+                                    selected_session = sessions.iter().position(|s| s == &thread_id).unwrap_or(0);
+                                    sessions_overlay = true;
+                                    input_buffer.clear();
+                                    current_action = "Browsing sessions".to_string();
+                                    continue;
+                                }
+
+                                if prompt == "/new" {
+                                    session_counter += 1;
+                                    thread_id = format!("tui-thread-session-{}", session_counter);
+                                    storage
+        .create_thread(&thread_id, Some("tui-user".to_string()))
+        .await?;
+                                    sessions.push(thread_id.clone());
+                                    selected_session = sessions.len().saturating_sub(1);
+
+                                    input_buffer.clear();
+                                    responses.clear();
+                                    task_list.clear();
+                                    scroll_offset = 0;
+                                    auto_scroll = true;
+                                    current_action = "Started a new session".to_string();
+                                    responses.push(LogEntry {
+                                        kind: LogKind::Info,
+                                        text: format!(
+                                            "Started a fresh session ({}). Previous conversation and task list were cleared.",
+                                            thread_id
+                                        ),
+                                    });
+                                    continue;
+                                }
+
                                 responses.push(LogEntry {
                                     kind: LogKind::User,
                                     text: prompt.clone(),
@@ -772,10 +902,12 @@ async fn run_app(
                                 // Spawn the async streaming task
                                 let agent = test_agent.clone();
                                 let tx_agent = tx.clone();
+                                let active_thread_id = thread_id.clone();
                                 tokio::spawn(async move {
                                     let options = GenerateOptions::new()
-                                        .thread_id(thread_id)
-                                        .resource_id("tui-user");
+                                        .thread_id(active_thread_id)
+                                        .resource_id("tui-user")
+                                        .max_steps(40);
 
                                     match agent.stream_with_options(&prompt, options).await {
                                         Ok(mut stream) => {
@@ -907,6 +1039,7 @@ async fn run_app(
                     }
                 }
                 UiEvent::AgentToolCall { name, args } => {
+                    last_tool_call_args = Some((name.clone(), args.clone()));
                     current_action = format!("Invoking tool: {}", name);
                     responses.push(LogEntry {
                         kind: LogKind::ToolCall,
@@ -920,9 +1053,18 @@ async fn run_app(
                         name.as_str(),
                         "task_write" | "task_update" | "task_complete" | "task_check"
                     ) {
+                        let call_args = if let Some((ref last_name, ref last_args)) = last_tool_call_args {
+                            if last_name == &name {
+                                Some(last_args.as_str())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         responses.push(LogEntry {
                             kind: LogKind::ToolResult,
-                            text: format_tool_result(&name, &result),
+                            text: format_tool_result(&name, &result, call_args),
                         });
                     }
                 }
@@ -1056,6 +1198,7 @@ mod tests {
         let result = format_tool_result(
             "glob",
             r#"{"paths":["D:\\project\\rloccle\\src\\agent.rs","D:\\project\\rloccle\\src\\tool.rs"]}"#,
+            None,
         );
 
         assert!(call.starts_with("Find files matching:"));
@@ -1069,6 +1212,7 @@ mod tests {
         let result = format_tool_result(
             "list_dir",
             r#"{"entries":["D:\\project\\rloccle\\.agents","D:\\project\\rloccle\\.env"],"remaining_count":10}"#,
+            None,
         );
 
         assert!(result.starts_with("Directory entries"));
@@ -1098,7 +1242,16 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let bg_suffix = if bg { " (background)" } else { "" };
-                format!("Execute command: {} {}{}", cmd, args, bg_suffix)
+                let full_cmd = format!("{} {}", cmd, args);
+                let max_len = 160;
+                let truncated_cmd = if full_cmd.chars().count() > max_len {
+                    let mut truncated: String = full_cmd.chars().take(max_len).collect();
+                    truncated.push_str("... (truncated)");
+                    truncated
+                } else {
+                    full_cmd
+                };
+                format!("Execute command: {}{}", truncated_cmd, bg_suffix)
             }
             "write_file" => {
                 let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1148,7 +1301,7 @@ fn format_tool_call(name: &str, args_str: &str) -> String {
     }
 }
 
-fn format_tool_result(name: &str, result_str: &str) -> String {
+fn format_tool_result(name: &str, result_str: &str, call_args_str: Option<&str>) -> String {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(result_str);
     match parsed {
         Ok(serde_json::Value::Object(map)) => match name {
@@ -1167,7 +1320,7 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                     } else {
                         format!(
                             "Command succeeded (exit code 0)\n{}",
-                            truncate_plain_text(output, RESULT_PREVIEW_LIMIT)
+                            truncate_plain_text(output, CMD_RESULT_PREVIEW_LIMIT)
                         )
                     }
                 } else {
@@ -1175,8 +1328,8 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                         "Failed (exit code {})\nOutput:\n{}\nError:\n{}",
                         code.map(|v| v.to_string())
                             .unwrap_or_else(|| "unknown".to_string()),
-                        truncate_plain_text(stdout.trim(), RESULT_PREVIEW_LIMIT),
-                        truncate_plain_text(stderr.trim(), RESULT_PREVIEW_LIMIT)
+                        truncate_plain_text(stdout.trim(), CMD_RESULT_PREVIEW_LIMIT),
+                        truncate_plain_text(stderr.trim(), CMD_RESULT_PREVIEW_LIMIT)
                     )
                 }
             }
@@ -1198,13 +1351,13 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                     if !stdout.trim().is_empty() {
                         lines.push(format!(
                             "Output:\n{}",
-                            truncate_plain_text(stdout.trim(), RESULT_PREVIEW_LIMIT)
+                            truncate_plain_text(stdout.trim(), CMD_RESULT_PREVIEW_LIMIT)
                         ));
                     }
                     if !stderr.trim().is_empty() {
                         lines.push(format!(
                             "Error:\n{}",
-                            truncate_plain_text(stderr.trim(), RESULT_PREVIEW_LIMIT)
+                            truncate_plain_text(stderr.trim(), CMD_RESULT_PREVIEW_LIMIT)
                         ));
                     }
                     lines.join("\n")
@@ -1216,18 +1369,17 @@ fn format_tool_result(name: &str, result_str: &str) -> String {
                 let content = map.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let line_count = content.lines().count();
                 let char_count = content.chars().count();
-                let preview = truncate_plain_text(content.trim(), RESULT_PREVIEW_LIMIT);
-                if preview.is_empty() {
-                    format!(
-                        "Read file successfully\n  - Lines: {}\n  - Characters: {}",
-                        line_count, char_count
-                    )
-                } else {
-                    format!(
-                        "Read file successfully\n  - Lines: {}\n  - Characters: {}\nPreview:\n{}",
-                        line_count, char_count, preview
-                    )
-                }
+                let path_str = call_args_str
+                    .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                format!(
+                    "Read file successfully\n  - Path: {}\n  - Lines: {}\n  - Characters: {}",
+                    friendly_path(&path_str),
+                    line_count,
+                    char_count
+                )
             }
             "write_file" => {
                 if map
@@ -1419,3 +1571,11 @@ fn compute_diff(path: &str, new_content: &str) -> String {
         diff_output
     }
 }
+
+
+
+
+
+
+
+

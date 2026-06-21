@@ -14,6 +14,8 @@ macro_rules! agent_println {
     };
 }
 
+const DEFAULT_MAX_STEPS: usize = 40;
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub id: String,
@@ -201,7 +203,7 @@ impl Agent {
         };
 
         let mut steps = 0;
-        let max_steps = 15;
+        let max_steps = options.max_steps.unwrap_or(DEFAULT_MAX_STEPS);
 
         let final_content = loop {
             if steps >= max_steps {
@@ -391,7 +393,7 @@ impl Agent {
             tools: self.tools.clone(),
             tools_spec,
             steps: 0,
-            max_steps: 15,
+            max_steps: options.max_steps.unwrap_or(DEFAULT_MAX_STEPS),
             state: StreamState::Init,
             memory: self.memory.clone(),
             thread_id: options.thread_id,
@@ -526,6 +528,7 @@ impl AgentBuilder {
 pub struct GenerateOptions {
     pub thread_id: Option<String>,
     pub resource_id: Option<String>,
+    pub max_steps: Option<usize>,
 }
 
 impl GenerateOptions {
@@ -540,6 +543,11 @@ impl GenerateOptions {
 
     pub fn resource_id(mut self, id: impl Into<String>) -> Self {
         self.resource_id = Some(id.into());
+        self
+    }
+
+    pub fn max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = Some(max_steps);
         self
     }
 }
